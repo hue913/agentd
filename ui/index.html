@@ -8,87 +8,270 @@
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
+
+<!-- ── 引导层：第一次打开时挡住界面，告诉你三步怎么走 ────────────────── -->
+<div id="onboard" class="onboard">
+  <div class="onboard-card">
+    <div class="onboard-head">
+      <div class="onboard-mark"></div>
+      <div>
+        <h1>Council Agent</h1>
+        <p class="muted">多模型圆桌会 · 服务器终端 · 画面感知 · 运维面板</p>
+      </div>
+    </div>
+
+    <ol class="steps" id="steps">
+      <li class="step" data-step="1">
+        <div class="step-n">1</div>
+        <div class="step-body">
+          <h3>在本机打开一条隧道</h3>
+          <p class="muted">服务器不对公网开放任何端口，所有访问都走这一条 SSH 隧道。在你 Mac 的「终端」里运行：</p>
+          <div class="copyable">
+            <code id="tunnel-cmd">ssh -N -L 8765:127.0.0.1:8765 -L 8766:127.0.0.1:8765 -L 6080:127.0.0.1:6080 root@YOUR_SERVER</code>
+            <button class="copy" data-copy="tunnel-cmd">复制</button>
+          </div>
+          <p class="step-hint" id="tunnel-hint">隧道开着就行，这个窗口不用管。</p>
+        </div>
+      </li>
+
+      <li class="step" data-step="2">
+        <div class="step-n">2</div>
+        <div class="step-body">
+          <h3>填入访问令牌</h3>
+          <p class="muted">令牌在服务器上，读这一行就能拿到（下面的按钮会帮你复制命令）：</p>
+          <div class="copyable">
+            <code>ssh root@YOUR_SERVER 'cat /var/lib/agentd/api.token'</code>
+            <button class="copy" data-copy2="ssh root@YOUR_SERVER 'cat /var/lib/agentd/api.token'">复制</button>
+          </div>
+          <div class="token-row">
+            <input id="token-input" type="password" placeholder="粘贴令牌后点右侧验证" autocomplete="off" spellcheck="false">
+            <button class="primary" id="btn-verify">验证</button>
+          </div>
+          <p class="step-hint" id="token-hint">令牌只存在这个标签页里，关闭页面就忘了。</p>
+        </div>
+      </li>
+
+      <li class="step" data-step="3">
+        <div class="step-n">3</div>
+        <div class="step-body">
+          <h3>随便挑一个开始</h3>
+          <div class="pick">
+            <button class="pick-card" data-goto="terminal">
+              <span class="pick-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3.5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z"/><path d="M4 7l2 1.5L4 10"/><path d="M8 10.5h4"/></svg></span>
+              <b>终端</b>
+              <i>真的 SSH 终端，能敲命令、能改窗口大小</i>
+            </button>
+            <button class="pick-card" data-goto="screen">
+              <span class="pick-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1.2"/><path d="M5.5 14h5"/><path d="M8 11.5V14"/></svg></span>
+              <b>画面</b>
+              <i>服务器桌面实时画面，以及模型看到了什么</i>
+            </button>
+            <button class="pick-card" data-goto="council">
+              <span class="pick-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="4.6" r="1.9"/><circle cx="3.4" cy="11.4" r="1.6"/><circle cx="12.6" cy="11.4" r="1.6"/><path d="M6.8 6.1L4.5 10M9.2 6.1l2.3 3.9M5.2 11.6h5.6"/></svg></span>
+              <b>圆桌会</b>
+              <i>多个模型各自出方案、互相质疑、最后裁决</i>
+            </button>
+            <button class="pick-card" data-goto="ops">
+              <span class="pick-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 13.5h12"/><path d="M4.2 13.5V9M8 13.5V4.5M11.8 13.5v-6"/></svg></span>
+              <b>运维</b>
+              <i>负载、内存、磁盘、服务状态、每条记忆的信用</i>
+            </button>
+            <button class="pick-card" data-goto="models">
+              <span class="pick-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.8M8 12.4v1.8M1.8 8h1.8M12.4 8h1.8M3.7 3.7l1.3 1.3M11 11l1.3 1.3M12.3 3.7L11 5M5 11l-1.3 1.3"/></svg></span>
+              <b>模型</b>
+              <i>把任意模型请上圆桌；缺密钥会如实标出</i>
+            </button>
+          </div>
+        </div>
+      </li>
+    </ol>
+
+    <div class="onboard-foot">
+      <span class="muted" id="onboard-status">正在检查隧道…</span>
+      <button class="ghost" id="btn-skip">跳过引导</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── 顶栏 ─────────────────────────────────────────────────────────── -->
 <header class="bar">
   <div class="brand">
-    <span class="dot" id="conn-dot" title="connection"></span>
+    <span class="dot" id="conn-dot"></span>
     <strong>Council Agent</strong>
-    <span class="sub" id="conn-text">connecting…</span>
+    <span class="chip" id="conn-text">连接中…</span>
   </div>
+
   <nav class="tabs" id="tabs">
-    <button data-view="council" class="on">圆桌会</button>
-    <button data-view="terminal">终端</button>
-    <button data-view="screen">画面</button>
-    <button data-view="ops">运维</button>
-    <button data-view="approvals">审批<span class="badge" id="appr-badge" hidden>0</span></button>
+    <button data-view="council" class="on" title="圆桌会"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="4.6" r="1.9"/><circle cx="3.4" cy="11.4" r="1.6"/><circle cx="12.6" cy="11.4" r="1.6"/><path d="M6.8 6.1L4.5 10M9.2 6.1l2.3 3.9M5.2 11.6h5.6"/></svg></span></button>
+    <button data-view="terminal" title="终端"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3.5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z"/><path d="M4 7l2 1.5L4 10"/><path d="M8 10.5h4"/></svg></span></button>
+    <button data-view="screen" title="画面"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1.2"/><path d="M5.5 14h5"/><path d="M8 11.5V14"/></svg></span></button>
+    <button data-view="ops" title="运维"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 13.5h12"/><path d="M4.2 13.5V9M8 13.5V4.5M11.8 13.5v-6"/></svg></span></button>
+    <button data-view="approvals" title="审批"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8l5 1.9v4c0 3.2-2.1 5.4-5 6.5-2.9-1.1-5-3.3-5-6.5v-4l5-1.9z"/><path d="M5.9 7.9l1.5 1.5 2.8-2.9"/></svg></span><span class="badge" id="appr-badge" hidden>0</span></button>
+    <button data-view="models" title="模型席位"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.8M8 12.4v1.8M1.8 8h1.8M12.4 8h1.8M3.7 3.7l1.3 1.3M11 11l1.3 1.3M12.3 3.7L11 5M5 11l-1.3 1.3"/></svg></span></button>
   </nav>
+
   <div class="right">
-    <label class="cost" title="本轮圆桌会分角色 token / 费用">成本 <b id="cost-total">—</b></label>
-    <button id="btn-refresh" class="ghost" title="刷新">⟳</button>
+    <div class="cost" id="cost-box" hidden><span class="muted">本轮</span> <b id="cost-total">—</b></div>
+    <button class="icon-btn" id="btn-help" title="使用步骤">?</button>
+    <button class="icon-btn" id="btn-refresh" title="刷新">⟳</button>
   </div>
 </header>
 
 <main>
-  <!-- council -->
+  <!-- 圆桌会 -->
   <section class="view on" id="view-council">
-    <div class="council-head">
-      <input id="task-input" placeholder="交给圆桌会的问题，例如：nginx 不服务，怎么排查？">
+    <div class="panel">
+      <input id="task-input" placeholder="想问圆桌会什么？例如：nginx 挂了该怎么排查">
       <label class="chk"><input type="checkbox" id="use-council" checked> 多模型圆桌</label>
       <button id="btn-run" class="primary">开始</button>
     </div>
-    <div id="dissent" class="dissent" hidden>
-      <h3>未消解的分歧</h3>
-      <p class="hint">分歧不会被折叠成「已达成共识」。每一条都是需要人来判断的风险。</p>
+
+    <div class="panel seats-bar">
+      <span class="muted sm">上桌席位</span>
+      <div id="council-seats" class="seat-picker"><span class="muted sm">正在读取模型席位…</span></div>
+      <span class="spacer"></span>
+      <button class="ghost sm" id="btn-seat-manage">管理模型</button>
+    </div>
+
+    <div id="dissent" class="card dissent" hidden>
+      <div class="card-h"><h3>未消解的分歧</h3><span class="tag warn">不会被折叠成「已达成共识」</span></div>
+      <p class="muted sm">这些是模型之间没谈拢的地方。每一条都需要你自己判断，而不是替它们拍板。</p>
       <ul id="dissent-list"></ul>
     </div>
-    <div class="cols" id="council-cols"></div>
-  </section>
 
-  <!-- terminal -->
-  <section class="view" id="view-terminal">
-    <div class="term-head">
-      <select id="pty-host"></select>
-      <input id="pty-purpose" placeholder="这次会话要做什么？（准入检查读这一项）" value="查看服务状态">
-      <button id="btn-pty-open" class="primary">打开</button>
-      <span id="pty-state" class="sub"></span>
+    <div id="council-answer" class="card answer" hidden>
+      <div class="card-h"><h3>最终答案</h3><span class="tag ok" id="answer-tag">已结束</span></div>
+      <p id="answer-text"></p>
     </div>
-    <div id="term"></div>
+
+    <div class="cols" id="council-cols"></div>
+    <div class="empty" id="council-empty">
+      <div class="empty-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="4.6" r="1.9"/><circle cx="3.4" cy="11.4" r="1.6"/><circle cx="12.6" cy="11.4" r="1.6"/><path d="M6.8 6.1L4.5 10M9.2 6.1l2.3 3.9M5.2 11.6h5.6"/></svg></div>
+      <p><b>还没有运行记录。</b></p>
+      <p class="muted">在上面写一个问题点「开始」。模型会以真实工具（SSH / 本机命令 / 文件）执行动作；开了圆桌后，多个模型各自出方案、互相质疑，最后由一个裁决者定稿。</p>
+    </div>
+
+    <div class="card" id="council-trace-card" hidden style="margin-top:14px">
+      <div class="card-h"><h3>执行轨迹</h3><span class="muted sm">每一步都留着 z / 优势 / 召回数，点击展开</span></div>
+      <div id="council-trace"></div>
+    </div>
   </section>
 
-  <!-- screen -->
+  <!-- 终端 -->
+  <section class="view" id="view-terminal">
+    <div class="panel term-bar">
+      <select id="pty-host"></select>
+      <input id="pty-purpose" placeholder="这次要做什么？（准入检查读这一项）" value="查看服务状态">
+      <button id="btn-pty-open" class="primary">打开</button>
+      <span class="chip" id="pty-state">未打开</span>
+      <button class="ghost sm" id="btn-pty-close">关闭</button>
+    </div>
+    <div id="term-wrap"><div id="term"></div></div>
+    <div class="empty" id="term-empty">
+      <div class="empty-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3.5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z"/><path d="M4 7l2 1.5L4 10"/><path d="M8 10.5h4"/></svg></div>
+      <p><b>打开一个真实 SSH 终端。</b></p>
+      <p class="muted">选主机、说明用途，点「打开」。这是真 shell —— 能敲命令、改窗口大小，不是伪终端。</p>
+      <p class="muted sm">注意：交互式终端里逐字符无法预判危险命令，所以准入检查读的是「用途」描述，全程审计留痕。</p>
+    </div>
+  </section>
+
+  <!-- 画面 -->
   <section class="view" id="view-screen">
-    <div class="screen-head">
-      <button id="btn-grab">抓帧</button>
+    <div class="panel term-bar">
+      <button id="btn-grab" class="primary">抓一帧</button>
       <button id="btn-auto" class="ghost">自动刷新</button>
-      <span id="screen-meta" class="sub"></span>
-      <span id="vision-state" class="tag warn"></span>
+      <span class="chip" id="screen-meta">未抓取</span>
+      <span class="tag warn" id="vision-state">视觉模型未接入</span>
+      <span class="spacer"></span>
+      <a class="ghost sm" id="novnc-link" href="#" target="_blank" rel="noreferrer">打开可交互画面 ↗</a>
     </div>
     <div class="screen-wrap">
       <div class="screen-left">
         <img id="screen-img" alt="服务器画面">
+        <p class="muted sm" id="screen-blank">还没有画面</p>
       </div>
       <div class="screen-right">
-        <h3>模型看到什么</h3>
-        <pre id="observe"></pre>
-        <h3>窗口</h3>
-        <div id="windows" class="windows"></div>
+        <div class="card">
+          <div class="card-h"><h3>模型看到了什么</h3></div>
+          <pre id="observe">点「抓一帧」后这里会显示模型视角的观察结果。</pre>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>画面上的窗口</h3></div>
+          <div id="windows" class="windows muted sm">—</div>
+        </div>
       </div>
     </div>
   </section>
 
-  <!-- ops -->
+  <!-- 运维 -->
   <section class="view" id="view-ops">
     <div class="ops-grid" id="ops-grid"></div>
-    <h3>进程</h3>
-    <table class="tbl" id="proc-table"><tbody></tbody></table>
-    <h3>日志</h3>
-    <select id="log-unit"></select>
-    <pre id="logs" class="logs"></pre>
+    <div class="two-col">
+      <div class="card">
+        <div class="card-h"><h3>进程</h3><span class="muted sm">按内存排序</span></div>
+        <table class="tbl" id="proc-table"><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <div class="card-h"><h3>每条记忆的信用</h3><span class="muted sm">被采纳 / 被否决</span></div>
+        <div id="credit-box" class="muted sm">—</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h">
+        <h3>日志</h3>
+        <select id="log-unit" class="sm"></select>
+      </div>
+      <pre id="logs" class="logs muted">—</pre>
+    </div>
   </section>
 
-  <!-- approvals -->
+  <!-- 审批 -->
   <section class="view" id="view-approvals">
-    <div id="appr-empty" class="empty">没有待审批的请求。</div>
+    <div id="appr-empty" class="empty">
+      <div class="empty-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8l5 1.9v4c0 3.2-2.1 5.4-5 6.5-2.9-1.1-5-3.3-5-6.5v-4l5-1.9z"/><path d="M5.9 7.9l1.5 1.5 2.8-2.9"/></svg></div>
+      <p><b>没有待审批的请求。</b></p>
+      <p class="muted">当 Agent 准备执行危险命令时会在这里等你。隧道断开时请求会被放弃，<b>绝不会自动批准</b>。</p>
+    </div>
     <div id="appr-list"></div>
+  </section>
+
+  <!-- 模型席位 -->
+  <section class="view" id="view-models">
+    <div class="panel">
+      <span class="muted sm">圆桌会不绑定任何厂商：任意 OpenAI 兼容端点（含你自己的中转）或原生 Anthropic / Gemini。没配密钥的席位会如实标出，圆桌会自动跳过它。</span>
+      <span class="spacer"></span>
+      <button class="ghost sm" id="btn-seat-reload">刷新</button>
+    </div>
+
+    <div id="seat-list" class="cols"></div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-h"><h3>添加 / 更新席位</h3><span class="muted sm">同名席位会被覆盖；改完立即生效，不用重启</span></div>
+      <div class="seat-form">
+        <label>席位名<input id="seat-name" placeholder="lab / fast / claude" autocomplete="off"></label>
+        <label>协议<select id="seat-kind">
+          <option value="openai_compat">OpenAI 兼容</option>
+          <option value="anthropic">Anthropic 原生</option>
+          <option value="gemini">Gemini 原生</option>
+        </select></label>
+        <label>模型名<input id="seat-model" placeholder="MiniMax-M2 / claude-sonnet-4-5" autocomplete="off"></label>
+        <label>Base URL<input id="seat-base" placeholder="OpenAI 兼容必填，如 https://api.example.com/v1" autocomplete="off"></label>
+        <label>密钥环境变量<input id="seat-keyenv" placeholder="推荐：AGENTD_MINIMAX_KEY（systemd 环境里配置）" autocomplete="off"></label>
+        <label>或直接填 API Key<input id="seat-key" type="password" placeholder="会以明文写入 0600 配置文件" autocomplete="new-password"></label>
+        <label>档位<select id="seat-tier">
+          <option value="strong">strong（强，参与裁决）</option>
+          <option value="cheap">cheap（省，适合跑量）</option>
+        </select></label>
+      </div>
+      <div class="seat-actions">
+        <button id="btn-seat-save" class="primary">保存席位</button>
+        <button id="btn-seat-clear" class="ghost">清空表单</button>
+      </div>
+      <p class="muted sm" style="margin:10px 0 0">
+        补密钥的两条路：① 在服务器 <code>/etc/systemd/system/agentd.env</code> 里设置 <code>AGENTD_*</code> 变量并重启 agentd；
+        ② 直接填 API Key（写入 <code>/var/lib/agentd/agentd.json</code>，权限 0600）。保存后点席位上的「探活」验证连通与解码档位。
+      </p>
+    </div>
   </section>
 </main>
 

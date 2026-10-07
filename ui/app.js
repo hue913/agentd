@@ -1,13 +1,12 @@
 /* Council Agent console.
  *
- * One bundle serves both surfaces: the browser console and the Tauri shell
- * load this same file. Only the transport differs -- see api() below.
+ * One bundle, two hosts: the browser console and the Tauri shell both load this
+ * file. Only the origin differs.
  *
- * Two conventions worth knowing:
- *  - The bearer token lives in sessionStorage, never localStorage, so it does
- *    not outlive the tab and is not readable by another page on the host.
- *  - Approval is always an explicit click. A disconnected socket means the
- *    pending request is abandoned, never auto-approved.
+ * The onboarding layer is not decoration. Someone opening this for the first
+ * time needs to know three things in order: open the tunnel, prove who you are,
+ * pick somewhere to start. Each step reports its own state, so "is it working"
+ * is never a guess.
  */
 (() => {
   "use strict";
@@ -16,13 +15,17 @@
   const state = {
     token: sessionStorage.getItem("agentd_token") || "",
     session: null,
-    pty: null,
-    term: null,
-    fit: null,
-    auto: false,
+    pty: null, ws: null,
+    term: null, fit: null,
+    auto: null,
+    onboardSeen: sessionStorage.getItem("agentd_onboarded") === "1",
   };
 
-  // ---------- transport ----------
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  /* ───────────────────────── transport ───────────────────────── */
+
   async function api(path, opts = {}) {
     const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
     if (state.token) headers["Authorization"] = `Bearer ${state.token}`;
@@ -35,78 +38,230 @@
     return res.status === 204 ? null : res.json();
   }
 
-  function toast(msg, bad) {
+  let toastTimer;
+  function toast(msg, kind) {
     const el = $("toast");
     el.textContent = msg;
-    el.className = "toast" + (bad ? " bad" : "");
+    el.className = "toast" + (kind ? " " + kind : "");
     el.hidden = false;
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => { el.hidden = true; }, 4200);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, 4200);
   }
 
-  function setConn(ok, text) {
+  function conn(ok, text) {
     $("conn-dot").className = "dot " + (ok ? "ok" : "bad");
     $("conn-text").textContent = text;
   }
 
-  // ---------- token gate ----------
-  // /healthz is deliberately public, so it is used to discover whether a token
-  // is required rather than assuming one.
-  async function bootstrap() {
+  /* ───────────────────────── onboarding ───────────────────────── */
+
+  async function probeHealth() {
     try {
-      const health = await fetch("healthz").then((r) => r.json());
-      setConn(true, `kernel β=${health.kernel?.beta ?? "?"} γ=${health.kernel?.gamma ?? "?"}`);
+      const h = await fetch("healthz").then((r) => r.json());
+      conn(true, `已连接 · ${h.kernel?.steps ?? 0} 条记忆`);
+      markStep(1, true, "隧道已通，可以继续下一步");
+      return true;
     } catch (e) {
-      setConn(false, "cannot reach agentd");
-      return;
+      conn(false, "隧道未建立");
+      markStep(1, false, "还没连上 —— 先在终端里跑上面那条 ssh 命令");
+      return false;
     }
+  }
+
+  function markStep(n, done, hint) {
+    const el = document.querySelector(`.step[data-step="${n}"]`);
+    if (!el) return;
+    el.classList.toggle("done", !!done);
+    const target = el.querySelector(".step-hint");
+    if (target && hint) {
+      target.textContent = hint;
+      target.classList.toggle("ok", !!done);
+    }
+  }
+
+  function wireCopy() {
+    document.querySelectorAll("[data-copy]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const text = $(btn.dataset.copy)?.textContent ?? "";
+        await copy(text);
+        flash(btn, "已复制");
+      });
+    });
+    document.querySelectorAll("[data-copy2]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await copy(btn.dataset.copy2);
+        flash(btn, "已复制");
+      });
+    });
+  }
+
+  async function copy(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      // Clipboard API needs a secure context; the SSH tunnel is plain http, so
+      // fall back rather than silently doing nothing.
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (__) {}
+      ta.remove();
+    }
+  }
+
+  function flash(btn, msg) {
+    const old = btn.textContent;
+    btn.textContent = msg;
+    btn.classList.add("ok");
+    setTimeout(() => { btn.textContent = old; btn.classList.remove("ok"); }, 1400);
+  }
+
+  async function verifyToken() {
+    const token = $("token-input").value.trim();
+    if (!token) return toast("先粘贴令牌", "bad");
+    state.token = token;
     try {
       await api("api/state");
+      sessionStorage.setItem("agentd_token", token);
+      markStep(2, true, "验证通过，令牌已存在本标签页");
+      $("onboard-status").textContent = "一切就绪 —— 挑一个开始吧。";
+      toast("验证通过", "good");
+      await loadState();
+      return true;
     } catch (e) {
-      const token = prompt("agentd 需要 Bearer token（服务器上 /var/lib/agentd/api.token）");
-      if (!token) { setConn(false, "no token"); return; }
-      state.token = token.trim();
-      sessionStorage.setItem("agentd_token", state.token);
-      await refreshState();
+      state.token = sessionStorage.getItem("agentd_token") || "";
+      $("token-input").value = "";
+      markStep(2, false, `验证失败：${e.message}`);
+      return false;
     }
   }
 
-  // ---------- council ----------
-  async function refreshState() {
-    const st = await api("api/state");
-    setConn(true, `${Object.keys(st.providers || {}).length} 模型 · ${(st.hosts || []).length} 主机`);
+  function closeOnboard() {
+    $("onboard").hidden = true;
+    sessionStorage.setItem("agentd_onboarded", "1");
+    state.onboardSeen = true;
+  }
 
-    const sel = $("pty-host");
-    if (sel && sel.options.length === 0) {
-      (st.hosts || []).forEach((h) => sel.add(new Option(h, h)));
-    }
-    const lu = $("log-unit");
-    if (lu && lu.options.length === 0) {
-      (st.services || []).forEach((s) => lu.add(new Option(s.unit, s.unit)));
-      if (!lu.options.length) {
-        ["agentd.service", "ssh.service", "nginx.service"].forEach((u) => lu.add(new Option(u, u)));
+  async function initOnboarding() {
+    wireCopy();
+    $("btn-verify").addEventListener("click", verifyToken);
+    $("btn-skip").addEventListener("click", closeOnboard);
+    $("btn-help").addEventListener("click", () => { $("onboard").hidden = false; });
+    $("token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") verifyToken(); });
+
+    document.querySelectorAll(".pick-card").forEach((card) => {
+      card.addEventListener("click", () => {
+        closeOnboard();
+        goto(card.dataset.goto);
+      });
+    });
+
+    if (state.onboardSeen) $("onboard").hidden = true;
+
+    // Step 1 is a real check, not a claim.
+    const up = await probeHealth();
+    const status = $("onboard-status");
+    if (up && state.token) {
+      try {
+        await api("api/state");
+        markStep(2, true, "令牌有效");
+        status.textContent = "隧道已通、令牌有效 —— 一切就绪。";
+      } catch (_) {
+        status.textContent = "隧道已通，还需要填一次令牌。";
       }
+    } else if (up) {
+      status.textContent = "隧道已通，填一下令牌就能用。";
+      $("token-input").focus();
+    } else {
+      status.textContent = "先建立隧道，再回来。";
     }
   }
+
+  /* ───────────────────────── navigation ───────────────────────── */
+
+  function goto(view) {
+    document.querySelectorAll(".tabs button").forEach((b) =>
+      b.classList.toggle("on", b.dataset.view === view));
+    document.querySelectorAll(".view").forEach((v) =>
+      v.classList.toggle("on", v.id === "view-" + view));
+
+    if (view === "ops") { refreshOps(); loadLogs(); loadCredit(); }
+    if (view === "screen") { checkVision(); if (state.auto === null) grabFrame(); }
+    if (view === "models") loadSeats();
+    if (view === "council") loadSeatPicker();
+    if (view === "terminal" && state.term) setTimeout(() => { try { state.fit.fit(); } catch (_) {} }, 40);
+  }
+
+  /* ───────────────────────── state ───────────────────────── */
+
+  async function loadState() {
+    try {
+      const st = await api("api/state");
+      const nModels = Object.keys(st.providers || {}).length;
+      const nHosts = (st.hosts || []).length;
+      conn(true, `${nModels} 个模型 · ${nHosts} 台主机`);
+
+      const hostSel = $("pty-host");
+      if (hostSel && !hostSel.options.length) {
+        (st.hosts || []).forEach((h) => hostSel.add(new Option(h, h)));
+        if (!hostSel.options.length) {
+          hostSel.add(new Option("（没有配置主机）", ""));
+          hostSel.disabled = true;
+        }
+      }
+      const logSel = $("log-unit");
+      if (logSel && !logSel.options.length) {
+        (st.services || []).forEach((s) => logSel.add(new Option(s.unit, s.unit)));
+        if (!logSel.options.length) {
+          ["agentd.service", "ssh.service", "nginx.service"].forEach((u) => logSel.add(new Option(u, u)));
+        }
+      }
+      return st;
+    } catch (e) {
+      conn(false, e.message);
+      return null;
+    }
+  }
+
+  /* ───────────────────────── council ───────────────────────── */
 
   async function runCouncil() {
     const task = $("task-input").value.trim();
-    if (!task) return toast("先写下要问圆桌会的问题", true);
-    $("btn-run").disabled = true;
+    if (!task) return toast("先写下要问的问题", "bad");
+    const btn = $("btn-run");
+    btn.disabled = true;
+    btn.textContent = "进行中…";
     $("council-cols").innerHTML = "";
+    $("council-empty").hidden = true;
     $("dissent").hidden = true;
+    $("council-answer").hidden = true;
+    $("council-trace-card").hidden = true;
+
     try {
+      // kind=ops: the goal is open text, and actions are real tool calls
+      // (ssh.exec / local.exec / fs.*) executed through the same safety gate.
       const r = await api("api/session", {
         method: "POST",
-        body: JSON.stringify({ task, council: $("use-council").checked, max_steps: 12 }),
+        body: JSON.stringify({
+          task,
+          kind: "ops",
+          council: $("use-council").checked,
+          members: chosenMembers(),
+          max_steps: 12,
+        }),
       });
       state.session = r.session;
-      toast(`session ${r.session}`);
+      toast(`已启动 · ${r.session}`);
       pollSession();
     } catch (e) {
-      toast("启动失败: " + e.message, true);
+      toast("启动失败：" + e.message, "bad");
+      $("council-empty").hidden = false;
     } finally {
-      $("btn-run").disabled = false;
+      btn.disabled = false;
+      btn.textContent = "开始";
     }
   }
 
@@ -114,77 +269,304 @@
     if (!state.session) return;
     try {
       const s = await api(`api/session/${state.session}`);
-      if (s.status === "running" || s.status === "pending") {
-        return setTimeout(pollSession, 1200);
-      }
+      if (s.status === "running" || s.status === "pending") return setTimeout(pollSession, 1200);
       renderReport(s);
     } catch (e) {
-      toast(e.message, true);
+      toast(e.message, "bad");
     }
   }
 
   function renderReport(s) {
     const rep = s.report || {};
-    const cols = $("council-cols");
-    cols.innerHTML = "";
-
-    // Costs: the panel most products do not show at all.
     const tok = rep.tokens || {};
+
+    $("cost-box").hidden = false;
     $("cost-total").textContent = tok.total_tokens
-      ? `${tok.total_tokens.toLocaleString()} tok${tok.est_usd ? ` / $${tok.est_usd.toFixed(4)}` : ""}`
+      ? `${tok.total_tokens.toLocaleString()} tok${tok.est_usd ? ` · $${(+tok.est_usd).toFixed(4)}` : ""}`
       : "—";
 
-    const trace = rep.trace || [];
-    const byModel = new Map();
-    for (const step of trace) {
-      const key = step.model || "model";
-      if (!byModel.has(key)) byModel.set(key, { picks: [], score: 0 });
-      const g = byModel.get(key);
-      if (step.chosen_action) g.picks.push(step.chosen_action);
-      g.score += (step.options || []).length;
+    // 最终答案（工具任务收尾时给的那段话）
+    if (rep.final) {
+      $("council-answer").hidden = false;
+      $("answer-text").textContent = rep.final;
+      const okRun = s.status === "success";
+      $("answer-tag").textContent = okRun ? "正常结束" : s.status;
+      $("answer-tag").className = "tag " + (okRun ? "ok" : "warn");
+    } else {
+      $("council-answer").hidden = true;
     }
-    if (!byModel.size) byModel.set("model", { picks: [rep.analysis || "(无轨迹)"], score: 0 });
 
-    for (const [name, g] of byModel) {
+    // 圆桌的每一步：谁提了什么、谁质疑了谁
+    const cols = $("council-cols");
+    cols.innerHTML = "";
+    const council = rep.council || [];
+    council.forEach((c) => {
       const card = document.createElement("div");
-      card.className = "card";
-      const picks = [...new Set(g.picks)].slice(0, 6);
-      card.innerHTML = `<h4>${escapeHtml(name)}</h4><p>${escapeHtml(picks.join("\n"))}</p>
-        <div class="meta">${g.picks.length} 步 · ${g.score} 个候选打分</div>`;
+      card.className = "speech" + (c.consensus ? " verdict" : "");
+      const rows = Object.entries(c.proposals || {}).map(([m, action]) => {
+        const w = c.weights && c.weights[m] != null ? ` · 权重 ${(+c.weights[m]).toFixed(2)}` : "";
+        const act = action ? esc(action) : '<span class="muted">（弃权 / 不可用）</span>';
+        return `<div class="proposal"><b>${esc(m)}</b><span class="muted sm">${w}</span><div class="act">${act}</div></div>`;
+      }).join("");
+      const objs = (c.objections || [])
+        .map((o) => `<li>${esc(o)}</li>`).join("");
+      card.innerHTML = `
+        <h4>第 ${(Number(c.step) || 0) + 1} 步 · ${c.consensus ? "达成一致" : "有分歧"}</h4>
+        ${rows || '<p class="muted">（这一步没有提案记录）</p>'}
+        ${objs ? `<div class="objs"><b class="muted sm">质疑</b><ul class="muted sm">${objs}</ul></div>` : ""}
+        <div class="meta">裁决：${esc(c.chosen || "—")}${c.tokens ? ` · ${c.tokens} tok` : ""}</div>`;
+      cols.appendChild(card);
+    });
+
+    // 单模型运行（或没有圆桌记录）时给一个朴素摘要
+    if (!council.length) {
+      const picks = (rep.trace || []).map((t) => t.chosen_action).filter(Boolean);
+      const card = document.createElement("div");
+      card.className = "speech";
+      card.innerHTML =
+        `<h4>裁决</h4><p>${esc([...new Set(picks)].slice(0, 8).join("\n") || rep.analysis || "（没有轨迹）")}</p>` +
+        `<div class="meta">${picks.length} 步${rep.stopped_by ? ` · ${esc(rep.stopped_by)}` : ""}</div>`;
       cols.appendChild(card);
     }
 
-    // Dissent is rendered as its own block, never folded into a verdict.
-    const risks = rep.risks || s.dissent || [];
+    // 分歧永远独立成块：反对、分裂、席位不可用
+    const risks = [];
+    council.forEach((c) => (c.risks || []).forEach((r) => risks.push(r)));
     if (risks.length) {
       $("dissent").hidden = false;
       const ul = $("dissent-list");
       ul.innerHTML = "";
       risks.forEach((r) => {
+        const who = r.member ? `${r.member}${r.against ? " → " + r.against : ""}` : "";
+        const stance = { object: "反对", split: "分歧", unavailable: "席位不可用" }[r.stance] || r.stance || "";
+        const head = [who, stance].filter(Boolean).join(" · ");
         const li = document.createElement("li");
-        li.textContent = typeof r === "string" ? r : (r.text || JSON.stringify(r));
+        li.textContent = head + (r.note ? `：${r.note}` : "");
         ul.appendChild(li);
       });
+    } else {
+      $("dissent").hidden = true;
     }
-    toast(`运行结束：${s.status}`);
+
+    // 执行轨迹：一个可展开的回放
+    const trace = rep.trace || [];
+    $("council-trace-card").hidden = trace.length === 0;
+    const box = $("council-trace");
+    box.innerHTML = "";
+    trace.forEach((t) => {
+      const det = document.createElement("details");
+      det.className = "trace-step" + (t.ok === false ? " failed" : "");
+      const viaCouncil = (t.mode || "").includes("council");
+      const failed = t.ok === false ? '<span class="tag warn">失败</span>' : "";
+      det.innerHTML =
+        `<summary><span class="n">${(Number(t.t) || 0) + 1}</span>` +
+        `<span class="act">${esc(t.chosen_action || "—")}</span>` +
+        `<span class="meta">${failed} ${t.retrieved || 0} 条召回 · ${t.duration_ms || 0}ms ` +
+        `${viaCouncil ? '<span class="tag ok">圆桌</span>' : '<span class="tag">单模型</span>'}</span></summary>` +
+        `<div class="trace-body">` +
+        `<div class="muted sm">当时的状态</div><pre>${esc(String(t.state || "").slice(0, 700))}</pre>` +
+        (t.tool_output ? `<div class="muted sm">执行结果</div><pre>${esc(t.tool_output)}</pre>` : "") +
+        (t.error ? `<div class="muted sm">错误</div><pre class="err">${esc(t.error)}</pre>` : "") +
+        `<div class="meta sm">优势基线 ${(+t.baseline || 0).toFixed(3)} · 探索 ${(t.explored || []).length} 项 · 风险档 ${t.risk || "—"}</div>` +
+        `</div>`;
+      box.appendChild(det);
+    });
+
+    $("council-empty").hidden = cols.children.length > 0;
+    toast(`运行结束 · ${s.status}`);
   }
 
-  // ---------- terminal ----------
+  /* ───────────────────────── 模型席位 ─────────────────────────
+   * 圆桌会不绑定任何厂商：这里管理的就是"谁能上桌"。席位保存在服务端
+   * agentd.json（0600），保存后热生效；缺密钥的席位会被明确标出，
+   * 圆桌会自动跳过它并记一条"席位不可用"的风险，而不是假装参与。
+   */
+
+  let seats = [];
+
+  async function loadSeats() {
+    const box = $("seat-list");
+    if (!box) return;
+    try {
+      const data = await api("api/providers");
+      seats = data.providers || [];
+      if (!seats.length) {
+        box.innerHTML =
+          `<div class="empty" style="grid-column:1/-1">` +
+          `<p><b>还没有配置任何模型。</b></p>` +
+          `<p class="muted">在下面填一个席位就能加入圆桌。OpenAI 兼容端点（含自建中转）填 Base URL；` +
+          `Anthropic / Gemini 原生协议留空即可。密钥优先用环境变量，不方便时也可直接填。</p></div>`;
+        return;
+      }
+      box.innerHTML = seats.map((s) => {
+        const key = !s.key_required
+          ? '<span class="tag">无需密钥</span>'
+          : s.key_present
+            ? '<span class="tag ok">密钥就绪</span>'
+            : '<span class="tag warn">缺密钥</span>';
+        return `<div class="speech seat" data-seat="${esc(s.name)}">
+          <h4>${esc(s.name)}${s.default ? ' <span class="tag ok">默认</span>' : ""}</h4>
+          <p class="seat-line">${esc(s.model)}</p>
+          <div class="meta">
+            <div>协议 ${esc(s.kind)} · 档位 ${esc(s.tier)}</div>
+            ${s.base_url ? `<div class="ellip">${esc(s.base_url)}</div>` : ""}
+            ${s.key_env ? `<div>密钥变量 <code>${esc(s.key_env)}</code></div>` : ""}
+            <div class="seat-tags">${key}</div>
+            <div class="seat-btns">
+              <button class="ghost sm" data-act="probe">探活</button>
+              <button class="ghost sm" data-act="edit">编辑</button>
+              <button class="ghost sm" data-act="del">删除</button>
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+      box.querySelectorAll(".seat").forEach((el) => {
+        const name = el.dataset.seat || "";
+        el.querySelector('[data-act="probe"]').onclick = () => probeSeat(name);
+        el.querySelector('[data-act="edit"]').onclick = () => fillSeatForm(name);
+        el.querySelector('[data-act="del"]').onclick = () => deleteSeat(name);
+      });
+    } catch (e) {
+      box.innerHTML = `<div class="muted" style="grid-column:1/-1">读取失败：${esc(e.message)}</div>`;
+    }
+  }
+
+  async function probeSeat(name) {
+    toast(`正在探活 ${name}…`);
+    try {
+      const r = await api(`api/providers/${encodeURIComponent(name)}/probe`, { method: "POST" });
+      if (r.reachable) {
+        toast(`${name} 可达 · 解码档位 ${r.decode_mode || "?"}${r.notes ? " · " + r.notes.slice(0, 80) : ""}`, "good");
+      } else {
+        toast(`${name} 不可达：${(r.notes || "无响应").slice(0, 120)}`, "bad");
+      }
+    } catch (e) {
+      toast(`探活失败：${e.message}`, "bad");
+    }
+  }
+
+  function fillSeatForm(name) {
+    const s = seats.find((x) => x.name === name);
+    if (!s) return;
+    $("seat-name").value = s.name;
+    $("seat-kind").value = s.kind || "openai_compat";
+    $("seat-model").value = s.model || "";
+    $("seat-base").value = s.base_url || "";
+    $("seat-keyenv").value = s.key_env || "";
+    $("seat-key").value = "";
+    $("seat-tier").value = s.tier || "strong";
+    $("seat-model").focus();
+    toast(`已载入 ${name}，改完点「保存席位」`);
+  }
+
+  function clearSeatForm() {
+    ["seat-name", "seat-model", "seat-base", "seat-keyenv", "seat-key"].forEach((id) => {
+      const el = $(id);
+      if (el) el.value = "";
+    });
+  }
+
+  async function saveSeat() {
+    const body = {
+      name: $("seat-name").value.trim(),
+      kind: $("seat-kind").value,
+      model: $("seat-model").value.trim(),
+      base_url: $("seat-base").value.trim(),
+      api_key_env: $("seat-keyenv").value.trim(),
+      api_key: $("seat-key").value.trim(),
+      tier: $("seat-tier").value,
+    };
+    if (!body.name || !body.model) return toast("席位名和模型名必填", "bad");
+    const btn = $("btn-seat-save");
+    btn.disabled = true;
+    try {
+      const r = await api("api/providers", { method: "POST", body: JSON.stringify(body) });
+      toast(`已保存席位 ${r.name}${r.note ? " · " + r.note : ""}`, "good");
+      clearSeatForm();
+      await loadSeats();
+      await loadSeatPicker();
+    } catch (e) {
+      toast("保存失败：" + e.message, "bad");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function deleteSeat(name) {
+    if (!name) return;
+    if (!confirm(`删除席位 ${name}？服务端配置文件会同步更新，圆桌将不再使用它。`)) return;
+    try {
+      await api(`api/providers/${encodeURIComponent(name)}`, { method: "DELETE" });
+      toast(`已删除 ${name}`);
+      await loadSeats();
+      await loadSeatPicker();
+    } catch (e) {
+      toast("删除失败：" + e.message, "bad");
+    }
+  }
+
+  async function loadSeatPicker() {
+    const box = $("council-seats");
+    if (!box) return;
+    try {
+      const data = await api("api/providers");
+      const list = data.providers || [];
+      if (!list.length) {
+        box.innerHTML = '<span class="muted sm">还没有模型 —— 去「模型」页添加任意端点（缺密钥会如实标出）。</span>';
+        return;
+      }
+      // 保持用户已勾选的状态；首次进入默认全选 —— 缺密钥的席位也在列，
+      // 只是标注出来，圆桌会跳过它并把「席位不可用」记进分歧块。
+      const prev = new Set([...box.querySelectorAll("input:checked")].map((i) => i.value));
+      const first = !box.querySelectorAll("input").length;
+      box.innerHTML = list.map((s) => {
+        const missing = s.key_required && !s.key_present;
+        const on = first ? true : prev.has(s.name);
+        return `<label class="chk sm${missing ? " dim" : ""}" title="${missing ? "缺密钥，圆桌会跳过它并记录一条风险" : ""}">` +
+          `<input type="checkbox" value="${esc(s.name)}"${on ? " checked" : ""}> ${esc(s.name)}` +
+          `${missing ? '<span class="muted">（缺密钥）</span>' : ""}</label>`;
+      }).join("");
+    } catch (_) {
+      box.innerHTML = '<span class="muted sm">读取席位失败（检查连接与令牌）</span>';
+    }
+  }
+
+  function chosenMembers() {
+    const boxes = [...document.querySelectorAll("#council-seats input")];
+    const checked = boxes.filter((i) => i.checked).map((i) => i.value);
+    // 全选（或没有席位）时交给服务端默认（主模型 + 按上限补齐）；
+    // 手动取消过才发送显式名单。空名单不发送 —— 圆的还是那张桌子。
+    return checked.length && checked.length < boxes.length ? checked : null;
+  }
+
+  /* ───────────────────────── terminal ───────────────────────── */
+
   async function openPty() {
     const host = $("pty-host").value;
-    if (!host) return toast("没有可用主机", true);
-    const purpose = $("pty-purpose").value.trim();
+    if (!host) return toast("没有可用主机", "bad");
     try {
       const s = await api("api/pty/open", {
         method: "POST",
-        body: JSON.stringify({ host, purpose, rows: 30, cols: 100 }),
+        body: JSON.stringify({ host, purpose: $("pty-purpose").value.trim(), rows: 30, cols: 100 }),
       });
       state.pty = s.session;
       $("pty-state").textContent = `${s.session} · ${s.host}`;
+      $("term-empty").hidden = true;
       connectPty();
+      toast("已打开终端");
     } catch (e) {
-      toast("打开失败: " + e.message, true);
+      toast("打开失败：" + e.message, "bad");
     }
+  }
+
+  async function closePty() {
+    if (!state.pty) return;
+    try { await api(`api/pty/${state.pty}/close`, { method: "POST" }); } catch (_) {}
+    if (state.ws) { try { state.ws.close(); } catch (_) {} }
+    state.pty = null;
+    $("pty-state").textContent = "未打开";
+    $("term-empty").hidden = false;
+    toast("终端已关闭");
   }
 
   function connectPty() {
@@ -192,8 +574,8 @@
     if (!state.term) {
       state.term = new Terminal({
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-        fontSize: 12, cursorBlink: true, scrollback: 5000,
-        theme: { background: "#0b0d11", foreground: "#e6e9ef" },
+        fontSize: 12, cursorBlink: true, scrollback: 6000,
+        theme: { background: "#08090d", foreground: "#e8ebf1", cursor: "#6aa9ff" },
       });
       state.fit = new FitAddon.FitAddon();
       state.term.loadAddon(state.fit);
@@ -203,80 +585,130 @@
         if (state.ws && state.ws.readyState === 1) state.ws.send(d);
       });
     }
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
     // A browser WebSocket cannot set an Authorization header, so the token
-    // rides in the query string -- the same path the server documents.
+    // rides in the query string -- the path the server documents.
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/api/pty/${state.pty}/stream?token=${encodeURIComponent(state.token)}`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     state.ws = ws;
+
     ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") return;      // control frame (ping/exit)
+      if (typeof ev.data === "string") return;   // ping / exit control frame
       state.term.write(new Uint8Array(ev.data));
     };
     ws.onclose = (ev) => {
-      $("pty-state").textContent = `已断开 (${ev.code})`;
-      if (ev.code === 4401) toast("PTY 鉴权失败：token 不对", true);
+      $("pty-state").textContent = ev.code === 1000 ? "已关闭" : `已断开 (${ev.code})`;
+      if (ev.code === 4401) toast("令牌不对，PTY 被拒绝", "bad");
     };
     ws.onopen = () => {
-      const send = (rows, cols) => ws.send(JSON.stringify({ type: "resize", rows, cols }));
-      send(state.term.rows, state.term.cols);
-      new ResizeObserver(() => {
-        try { state.fit.fit(); send(state.term.rows, state.term.cols); } catch (_) {}
-      }).observe($("term"));
+      const push = () => ws.send(JSON.stringify({ type: "resize", rows: state.term.rows, cols: state.term.cols }));
+      push();
+      new ResizeObserver(() => { try { state.fit.fit(); push(); } catch (_) {} }).observe($("term-wrap"));
     };
   }
 
-  // ---------- screen ----------
-  async function grabFrame() {
-    try {
-      const f = await api("api/screen/frame");
-      $("screen-img").src = `api/screen/frame.jpg?t=${f.ts}&_=${state.token}`;
-      $("screen-meta").textContent =
-        `${f.width}x${f.height} · ink ${(f.ink_ratio * 100).toFixed(1)}% · ` +
-        `${f.changed ? "有变化" : "无变化"} · ${f.blank ? "空白" : "有内容"} · ${(f.jpeg_bytes / 1024).toFixed(1)} KB`;
-      const obs = await api("api/screen/observe");
-      $("observe").textContent = obs.text;
-      const w = await api("api/screen/windows");
-      $("windows").innerHTML = (w.windows || [])
-        .map((x) => `<div>${escapeHtml(x.name || "(unnamed)")} · ${x.w}x${x.h} @ (${x.x},${x.y})</div>`)
-        .join("") || "<div class='sub'>none</div>";
-    } catch (e) {
-      toast("抓帧失败: " + e.message, true);
-    }
-  }
+  /* ───────────────────────── screen ───────────────────────── */
 
   async function checkVision() {
     try {
       const v = await api("api/screen/vision");
       const el = $("vision-state");
-      el.textContent = v.has_vision ? `视觉模型: ${v.model}` : "未接视觉模型（只有结构性描述）";
-      el.className = "tag " + (v.has_vision ? "ok" : "warn");
+      if (v.has_vision) {
+        el.textContent = `视觉模型：${v.model}`;
+        el.className = "tag ok";
+      } else {
+        el.textContent = "未接视觉模型（只有结构性描述）";
+        el.className = "tag warn";
+      }
     } catch (_) {}
   }
 
-  // ---------- ops ----------
+  async function grabFrame() {
+    try {
+      const f = await api("api/screen/frame");
+      $("screen-img").src = `api/screen/frame.jpg?t=${f.ts}`;
+      $("screen-meta").textContent =
+        `${f.width}×${f.height} · 有内容 ${(f.ink_ratio * 100).toFixed(0)}% · ` +
+        `${f.changed ? "画面有变化" : "画面未变"} · ${(f.jpeg_bytes / 1024).toFixed(0)} KB`;
+      $("screen-blank").textContent = f.blank
+        ? "画面是空的 —— 服务器上还没跑任何窗口程序"
+        : "";
+
+      const obs = await api("api/screen/observe");
+      $("observe").textContent = obs.text;
+
+      const w = await api("api/screen/windows");
+      $("windows").innerHTML = (w.windows || [])
+        .map((x) => `<div>${esc(x.name || "(无名窗口)")} · ${x.w}×${x.h} @ (${x.x},${x.y})</div>`)
+        .join("") || '<span>画面上没有窗口</span>';
+    } catch (e) {
+      toast("抓帧失败：" + e.message, "bad");
+    }
+  }
+
+  /* ───────────────────────── ops ───────────────────────── */
+
+  function stat(k, v, extra) {
+    return `<div class="stat"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>${extra || ""}</div>`;
+  }
+  function meter(pct) {
+    const cls = pct > 88 ? "bad" : pct > 70 ? "warn" : "";
+    return `<div class="meter"><i class="${cls}" style="width:${Math.min(100, pct)}%"></i></div>`;
+  }
+  function uptime(s) {
+    if (!s) return "—";
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    return d ? `${d} 天 ${h} 小时` : h ? `${h} 小时 ${m} 分` : `${m} 分`;
+  }
+  function pctOf(a, b) { return b ? Math.round((a / b) * 100) : 0; }
+
   async function refreshOps() {
     try {
       const snap = await api("api/sys/snapshot");
       const o = snap.overview || {};
-      const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
       const root = (o.disk || []).find((d) => d.mount === "/") || {};
       $("ops-grid").innerHTML = [
-        stat("运行时长", fmtUptime(o.uptime_s), ""),
-        stat("负载", `${(o.load1 ?? 0).toFixed(2)} / ${(o.load5 ?? 0).toFixed(2)} / ${(o.load15 ?? 0).toFixed(2)}`, ""),
-        stat("内存", `${pct(o.mem_total_kb - o.mem_avail_kb, o.mem_total_kb)}%`,
-          meter(o.mem_used_pct)),
-        stat("Swap", `${pct(o.swap_used_kb, o.swap_total_kb)}%`, meter(o.swap_total_kb ? (o.swap_used_kb / o.swap_total_kb) * 100 : 0)),
-        stat("根分区", `${root.use_pct ?? "?"}%`, meter(parseFloat(root.use_pct || 0))),
-        stat("磁盘可用", `${((root.avail || 0) / 2 ** 30).toFixed(1)} GB`, ""),
+        stat("已运行", uptime(o.uptime_s)),
+        stat("负载", `${(o.load1 ?? 0).toFixed(2)} · ${(o.load5 ?? 0).toFixed(2)} · ${(o.load15 ?? 0).toFixed(2)}`),
+        stat("内存", pctOf((o.mem_total_kb || 0) - (o.mem_avail_kb || 0), o.mem_total_kb) + "%", meter(o.mem_used_pct || 0)),
+        stat("Swap", pctOf(o.swap_used_kb, o.swap_total_kb) + "%",
+          meter(pctOf(o.swap_used_kb, o.swap_total_kb))),
+        stat("根分区", (root.use_pct ?? "?") + "%", meter(parseFloat(root.use_pct || 0))),
+        stat("磁盘可用", (((root.avail || 0) / 2 ** 30).toFixed(1)) + " GB"),
       ].join("");
 
       $("proc-table").querySelector("tbody").innerHTML = (snap.processes || [])
-        .map((p) => `<tr><td>${escapeHtml(p.comm)}</td><td>${(p.rss_kb / 1024).toFixed(1)} MB</td>
-                     <td>${p.cpu_pct}%</td><td>${fmtUptime(p.etime_s)}</td></tr>`).join("");
+        .map((p) => `<tr><td>${esc(p.comm)}</td><td>${(p.rss_kb / 1024).toFixed(1)} MB</td>` +
+                    `<td>${p.cpu_pct}%</td><td>${uptime(p.etime_s)}</td></tr>`)
+        .join("") || '<tr><td colspan="4" class="muted">—</td></tr>';
     } catch (e) {
-      toast("运维数据失败: " + e.message, true);
+      toast("运维数据拉取失败：" + e.message, "bad");
+    }
+  }
+
+  async function loadCredit() {
+    const box = $("credit-box");
+    try {
+      const d = await api("api/credit?limit=12");
+      const t = d.totals || {};
+      if (!t.decisions) {
+        box.innerHTML = `还没有可统计的记忆。<br><span class="muted">共 ${t.steps || 0} 条记忆，` +
+                        `等 Agent 真的检索过并做出选择后，这里会出现「被采纳 / 被否决」的计数。</span>`;
+        return;
+      }
+      const head = `<div class="muted sm" style="margin-bottom:8px">` +
+        `召回 ${t.recalls} 次 · 采纳 ${t.adopted} · 否决 ${t.rejected} · ` +
+        `采纳率 <b>${((t.adoption_rate ?? 0) * 100).toFixed(1)}%</b></div>`;
+      box.innerHTML = head + (d.entries || []).map((e) => {
+        const cls = e.credit >= 1 ? "up" : "down";
+        return `<div class="credit-row"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">` +
+          `${esc((e.action || "").slice(0, 40))}</span>` +
+          `<span class="credit-val ${cls}">×${(+e.credit).toFixed(2)}</span>` +
+          `<span class="muted">${e.adopted}/${e.rejected}</span></div>`;
+      }).join("");
+    } catch (e) {
+      box.textContent = "拉取失败：" + e.message;
     }
   }
 
@@ -285,90 +717,102 @@
     if (!unit) return;
     try {
       const r = await api(`api/sys/logs/${encodeURIComponent(unit)}?lines=120`);
-      $("logs").textContent = (r.entries || []).join("\n") || "(空)";
+      $("logs").textContent = (r.entries || []).join("\n") || "（这个服务还没有日志）";
     } catch (e) {
-      $("logs").textContent = "加载失败: " + e.message;
+      $("logs").textContent = "加载失败：" + e.message;
     }
   }
 
-  function stat(k, v, extra) {
-    return `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div>${extra || ""}</div>`;
-  }
-  function meter(pct) {
-    const cls = pct > 88 ? "bad" : pct > 70 ? "warn" : "";
-    return `<div class="bar-meter"><i class="${cls}" style="width:${Math.min(100, pct)}%"></i></div>`;
-  }
-  function fmtUptime(s) {
-    if (!s) return "—";
-    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
-    return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
-  }
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  }
+  /* ───────────────────────── approvals ───────────────────────── */
 
-  // ---------- approvals ----------
   async function refreshApprovals() {
+    if (!state.session) return;
     try {
-      const s = state.session ? await api(`api/session/${state.session}`) : null;
-      const pending = (s && s.pending_approvals) || [];
+      const s = await api(`api/session/${state.session}`);
+      const pending = s.pending_approvals || [];
       const list = $("appr-list");
       list.innerHTML = "";
       $("appr-empty").hidden = pending.length > 0;
       $("appr-badge").hidden = pending.length === 0;
       $("appr-badge").textContent = pending.length;
+
       pending.forEach((p) => {
-        const kind = (p.command || "").startsWith("[pty") ? "info" : (p.level || "confirm");
+        // Entries are objects now ({token, command|tool+args, reasons, level,
+        // host}); tolerate a bare token string in case of an older server.
+        if (typeof p === "string") p = { token: p };
+        const what = p.command
+          || (p.tool ? `${p.tool} ${JSON.stringify(p.args || {})}` : "(未知请求)");
+        const why = (p.reasons || []).join("；")
+          || (p.level === "block" ? "被安全门拦下，需要人工确认" : "需要人工确认");
         const el = document.createElement("div");
-        el.className = "appr " + (kind === "block" ? "block" : "");
-        el.innerHTML = `<div class="why">${escapeHtml((p.reasons || []).join("; ") || p.level || "")}</div>
-          <div class="cmd">${escapeHtml(p.command || "")}</div>
-          <div class="acts"><button class="approve">允许</button><button class="deny">拒绝</button></div>`;
+        el.className = "appr " + (p.level === "block" ? "block" : "");
+        el.innerHTML =
+          `<div class="why">${esc(why)}</div>` +
+          `<div class="cmd">${p.host ? esc(`[${p.host}] `) : ""}${esc(what)}</div>` +
+          `<div class="acts"><button class="approve">允许</button><button class="deny">拒绝</button></div>`;
         const [ok, no] = el.querySelectorAll("button");
         ok.onclick = () => decide(p.token, true, el);
         no.onclick = () => decide(p.token, false, el);
         list.appendChild(el);
       });
-    } catch (e) {
-      /* no session yet is not an error */
-    }
+    } catch (_) { /* session not started yet is not an error */ }
   }
 
   async function decide(token, approved, el) {
     el.remove();
     try {
       await api("api/approve", { method: "POST", body: JSON.stringify({ token, approved }) });
-      toast(approved ? "已允许" : "已拒绝");
+      toast(approved ? "已允许执行" : "已拒绝", approved ? "good" : "");
     } catch (e) {
-      toast("审批失败: " + e.message, true);
+      toast("审批失败：" + e.message, "bad");
     }
   }
 
-  // ---------- wiring ----------
+  /* ───────────────────────── boot ───────────────────────── */
+
   function init() {
     $("tabs").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-view]");
-      if (!b) return;
-      document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("on", x === b));
-      document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.id === "view-" + b.dataset.view));
-      if (b.dataset.view === "ops") { refreshOps(); loadLogs(); }
-      if (b.dataset.view === "screen") checkVision();
-      if (b.dataset.view === "terminal" && state.term) setTimeout(() => state.fit.fit(), 30);
+      if (b) goto(b.dataset.view);
     });
     $("btn-run").onclick = runCouncil;
     $("btn-pty-open").onclick = openPty;
+    $("btn-pty-close").onclick = closePty;
     $("btn-grab").onclick = grabFrame;
-    $("btn-refresh").onclick = () => { refreshState(); refreshOps(); };
-    $("btn-auto").onclick = () => {
-      state.auto = !state.auto;
-      $("btn-auto").textContent = state.auto ? "停止自动" : "自动刷新";
-      clearInterval(state._t);
-      if (state.auto) state._t = setInterval(grabFrame, 5000);
-    };
+    $("btn-refresh").onclick = async () => { await loadState(); refreshOps(); loadSeatPicker(); };
+    $("btn-seat-save").onclick = saveSeat;
+    $("btn-seat-clear").onclick = clearSeatForm;
+    $("btn-seat-reload").onclick = loadSeats;
+    $("btn-seat-manage").onclick = () => goto("models");
     $("log-unit").onchange = loadLogs;
+    $("btn-auto").onclick = () => {
+      if (state.auto) {
+        clearInterval(state.auto);
+        state.auto = null;
+        $("btn-auto").textContent = "自动刷新";
+      } else {
+        state.auto = setInterval(grabFrame, 5000);
+        $("btn-auto").textContent = "停止自动";
+      }
+    };
 
-    bootstrap().then(() => { refreshState(); refreshOps(); });
+    // The noVNC link only makes sense once a tunnel exists; keep it honest.
+    $("novnc-link").href = "http://127.0.0.1:6080/vnc.html";
+
+    initOnboarding().then(async () => {
+      if (state.token) {
+        try {
+          await api("api/state");
+          await loadState();
+          loadSeatPicker();
+          refreshOps();
+        } catch (_) {
+          state.token = "";
+          sessionStorage.removeItem("agentd_token");
+        }
+      }
+    });
+
     setInterval(refreshApprovals, 4000);
   }
 
