@@ -60,6 +60,13 @@ class Runtime:
         # Interactive shells are a separate capability from batch exec, with
         # their own admission check and their own reaper.
         self.pty = PTYHub(self.ssh, audit=self.audit)
+        # One ScreenCapture for the process: change detection is stateful, and a
+        # per-request capture would never see its own previous frame.
+        from .screen import Perceiver, ScreenActions, ScreenCapture
+
+        self.screen = (ScreenCapture(), Perceiver(actions=None))
+        self.screen_actions = ScreenActions(audit=self.audit)
+        self.screen[1].actions = self.screen_actions
         for host in self.config.get("ssh_hosts", []):
             self.ssh.add_host(HostSpec(**host))
         self.providers = self._build_providers()

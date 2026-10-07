@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import time
 
 from fastapi import APIRouter, Body, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -30,6 +29,8 @@ from pydantic import BaseModel
 
 from .. import sysinfo
 from ..envs.pty_env import PTYError, PTYRefused
+from ..screen.actions import ScreenActionError
+from pathlib import Path
 
 router = APIRouter()
 
@@ -49,24 +50,6 @@ def _token_ok(presented: str) -> bool:
 
     expected = STATE.get("token", "")
     return bool(expected) and hmac.compare_digest(presented, expected)
-
-
-def _control_frame(text: str) -> dict | None:
-    """Return the frame if `text` is a control JSON object, else None.
-
-    Only small objects whose first key is `type` qualify, so ordinary shell
-    input that happens to contain a brace is never swallowed.
-    """
-    stripped = text.strip()
-    if not stripped.startswith("{") or not stripped.endswith("}"):
-        return None
-    try:
-        payload = json.loads(stripped)
-    except ValueError:
-        return None
-    if isinstance(payload, dict) and isinstance(payload.get("type"), str):
-        return payload
-    return None
 
 
 # --- pty --------------------------------------------------------------------
@@ -138,27 +121,22 @@ async def pty_stream(ws: WebSocket, session_id: str, token: str = Query(default=
             await asyncio.sleep(0.05)
 
     async def sink() -> None:
-        """Client -> server. Control frames are JSON; everything else is keys.
-
-        Control frames are detected by parsing, not by prefix matching. A
-        prefix check silently misroutes a resize into the shell as literal
-        text the moment a client emits `{"type": "resize", ...}` with a space
-        after the colon -- which is exactly what json.dumps does.
-        """
+        """Client -> server. Resize arrives as JSON, keystrokes as raw text."""
         while not stop.is_set():
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
-            data = msg.get("text")
-            if data is not None:
-                control = _control_frame(data)
-                if control and control.get("type") == "resize":
+            if (data := msg.get("text")) is not None:
+                if data.startswith('{"type":"resize"'):
                     try:
-                        session.resize(int(control.get("rows", 24)), int(control.get("cols", 80)))
-                    except (TypeError, ValueError):
+                        import json
+
+                        payload = json.loads(data)
+                        session.resize(int(payload.get("rows", 24)), int(payload.get("cols", 80)))
+                    except (ValueError, TypeError):
                         pass  # a malformed resize is not worth dropping the shell over
-                    continue
-                await asyncio.to_thread(session.write, data.encode())
+                else:
+                    await asyncio.to_thread(session.write, data.encode())
             elif (raw := msg.get("bytes")) is not None:
                 await asyncio.to_thread(session.write, raw)
 
@@ -206,3 +184,106 @@ async def sys_logs(unit: str, lines: int = 200):
 @router.get("/api/sys/snapshot")
 async def sys_snapshot(sort: str = "rss"):
     return await asyncio.to_thread(sysinfo.snapshot, sort)
+
+# --- screen ----------------------------------------------------------------
+
+
+def _screen():
+    s = STATE.get("screen")
+    if s is None:
+        raise HTTPException(503, "screen capture not initialised")
+    return s
+
+
+def _actions():
+    a = STATE.get("screen_actions")
+    if a is None:
+        raise HTTPException(503, "screen actions not initialised")
+    return a
+
+
+@router.get("/api/screen/frame")
+async def screen_frame(image: bool = True):
+    """One frame. `image=false` is the cheap change-detector-only path."""
+    capture, perceiver = _screen()
+    frame = await asyncio.to_thread(capture.grab, image)
+    return frame.as_dict()
+
+
+@router.get("/api/screen/frame.jpg")
+async def screen_jpeg():
+    from fastapi.responses import FileResponse
+
+    capture, _ = _screen()
+    frame = await asyncio.to_thread(capture.grab, True)
+    if not frame.jpeg_path or not Path(frame.jpeg_path).exists():
+        raise HTTPException(503, "no image produced")
+    return FileResponse(frame.jpeg_path, media_type="image/jpeg",
+                        headers={"X-Frame-Sha": frame.sha[:16],
+                                 "X-Frame-Changed": "1" if frame.changed else "0"})
+
+
+@router.get("/api/screen/observe")
+async def screen_observe(question: str = ""):
+    capture, perceiver = _screen()
+    frame = await asyncio.to_thread(capture.grab, True)
+    obs = await asyncio.to_thread(
+        perceiver.observe, frame,
+        question=question or "Describe what is on this screen and what a user should do next.",
+    )
+    return obs.as_dict()
+
+
+@router.get("/api/screen/windows")
+async def screen_windows():
+    return await asyncio.to_thread(_actions().window_list)
+
+
+class ClickBody(BaseModel):
+    x: int
+    y: int
+    button: int = 1
+    times: int = 1
+
+
+class TypeBody(BaseModel):
+    text: str
+    delay_ms: int = 12
+
+
+class KeyBody(BaseModel):
+    key: str
+
+
+@router.post("/api/screen/click")
+async def screen_click(body: ClickBody):
+    try:
+        result = await asyncio.to_thread(_actions().click, body.x, body.y, body.button, body.times)
+    except ScreenActionError as exc:
+        raise HTTPException(400, str(exc))
+    return result.as_dict()
+
+
+@router.post("/api/screen/type")
+async def screen_type(body: TypeBody):
+    try:
+        result = await asyncio.to_thread(_actions().type_text, body.text, body.delay_ms)
+    except ScreenActionError as exc:
+        raise HTTPException(400, str(exc))
+    return result.as_dict()
+
+
+@router.post("/api/screen/key")
+async def screen_key(body: KeyBody):
+    try:
+        result = await asyncio.to_thread(_actions().key, body.key)
+    except ScreenActionError as exc:
+        raise HTTPException(400, str(exc))
+    return result.as_dict()
+
+
+@router.get("/api/screen/vision")
+async def screen_vision():
+    """Is a vision model actually attached? The agent should ask, not assume."""
+    _, perceiver = _screen()
+    return {"has_vision": perceiver.has_vision, "model": perceiver.model_name}

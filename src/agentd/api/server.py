@@ -241,6 +241,8 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
     # The ops router needs the runtime's PTY hub and the API token, so it is
     # wired after the app exists rather than built from a module-level import.
     ops.STATE["pty"] = rt.pty
+    ops.STATE["screen"] = rt.screen
+    ops.STATE["screen_actions"] = rt.screen_actions
     ops.STATE["token"] = server_token()
     app.include_router(ops.router)
 
