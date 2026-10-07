@@ -15,11 +15,30 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 
-from fastapi import HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 ALLOWED_SUFFIXES = {".html", ".js", ".css", ".json", ".svg", ".png", ".ico", ".woff", ".woff2", ".map"}
 MAX_BYTES = 8 * 1024 * 1024
+
+
+def _weak_etag(st: object) -> str:
+    """Weak validator from (size, mtime): same file content changes -> new tag.
+
+    Weak ("W/") on purpose: two servers or two writes within filesystem
+    timestamp granularity are not guaranteed byte-identical, so we only claim
+    semantic equivalence, which is all a console asset needs.
+    """
+    return f'W/"{st.st_size:x}-{st.st_mtime_ns:x}"'
+
+
+def _etag_matches(if_none_match: str, etag: str) -> bool:
+    # If-None-Match can be "*", a single tag, or a comma-separated list.
+    if_none_match = if_none_match.strip()
+    if if_none_match == "*":
+        return True
+    return any(candidate.strip() == etag
+               for candidate in if_none_match.split(","))
 
 # The API surface must never fall back to the SPA shell: an unknown /api/*
 # path has to answer 404 JSON, because a client that asked for an API resource
@@ -47,7 +66,7 @@ def make_ui_router(root: Path):
         return HTMLResponse(page.read_text(encoding="utf-8"))
 
     @router.get("/{asset:path}")
-    def asset(asset: str):
+    def asset(asset: str, request: Request):
         for prefix in API_OWNED_PREFIXES:
             if asset == prefix or asset.startswith(prefix + "/"):
                 # 404 before the filesystem: these are not console routes even
@@ -68,11 +87,20 @@ def make_ui_router(root: Path):
             if page.is_file():
                 return HTMLResponse(page.read_text(encoding="utf-8"))
             raise HTTPException(404, "not found")
-        if candidate.stat().st_size > MAX_BYTES:
+        st = candidate.stat()
+        if st.st_size > MAX_BYTES:
             raise HTTPException(413, "asset too large")
+        # Conditional request: with Cache-Control: no-cache the client still
+        # revalidates every time, but an unchanged asset costs a 304 with no
+        # body instead of a full re-download.
+        etag = _weak_etag(st)
+        inm = request.headers.get("if-none-match")
+        if inm and _etag_matches(inm, etag):
+            return Response(status_code=304,
+                            headers={"ETag": etag, "Cache-Control": "no-cache"})
         ctype = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
         return FileResponse(candidate, media_type=ctype,
-                            headers={"Cache-Control": "no-cache"})
+                            headers={"Cache-Control": "no-cache", "ETag": etag})
 
     return router
 
