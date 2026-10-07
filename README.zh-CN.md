@@ -20,7 +20,7 @@
 
 ![控制台：一场带着席位选择器的圆桌会](docs/images/console-council.png)
 
-> 桌面客户端（Tauri：macOS 英特尔 + M 系列、Windows）与 Agent 自己托管的同一份控制台：
+> 桌面客户端（Tauri：macOS 英特尔 + M 系列、Windows）与 Agent 自己托管的浏览器控制台：
 > **[hue913/council-agent](https://github.com/hue913/council-agent)**
 
 ---
@@ -179,9 +179,11 @@ POST /api/session
 
 ![引导页：开隧道、验证令牌、挑一个开始](docs/images/console-onboarding.png)
 
-**一份 bundle，两个宿主**：控制台既由 agentd 自己托管，也被 Tauri 桌面壳加载——
-不存在第二份需要同步的 UI。客户端负责打开并守护 SSH 隧道，附带托盘常驻。
-构建目标：macOS 通用包（英特尔 + M 系列）与 Windows（走 GitHub Actions——Tauri 无法从 Mac 交叉编译 Windows 包）。
+**两个独立客户端，一个服务端**。浏览器控制台是一份无构建的单页 bundle，由 agentd 自己
+伺服在 `/`：你通过 SSH 隧道在浏览器里打开它。桌面壳（Tauri，见 companion 仓库）是**独立
+实现，并不加载这份 bundle**——两者今天不共享任何 UI 代码。桌面壳的职责是打开并守护
+SSH 隧道，附带托盘常驻。构建目标：macOS 通用包（英特尔 + M 系列）与 Windows
+（走 GitHub Actions——Tauri 无法从 Mac 交叉编译 Windows 包）。
 
 → **[hue913/council-agent](https://github.com/hue913/council-agent)**
 

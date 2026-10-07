@@ -22,8 +22,8 @@ It runs on a $5 VPS. It runs keyless. It runs today.
 
 ![The console: a council run with the seats picker](docs/images/console-council.png)
 
-> Desktop client (Tauri, macOS Intel + Apple Silicon, Windows) and the same console served
-> by the agent itself: **[hue913/council-agent](https://github.com/hue913/council-agent)**.
+> Desktop client (Tauri, macOS Intel + Apple Silicon, Windows) plus the browser console
+> served by the agent itself: **[hue913/council-agent](https://github.com/hue913/council-agent)**.
 
 ---
 
@@ -193,9 +193,12 @@ What the council does, concretely:
 
 ![Onboarding: tunnel, token, pick where to start](docs/images/console-onboarding.png)
 
-One bundle, two hosts: the console is served by agentd itself *and* loaded by the Tauri
-desktop shell — there is no second UI to keep in sync. The client opens the SSH tunnel,
-supervises it, and adds tray presence. Builds: macOS universal (Intel + Apple Silicon) and
+Two independent clients, one server. The browser console is a single no-build
+bundle served by agentd itself at `/`: you open it in a browser over the SSH
+tunnel. The desktop shell (Tauri, in the companion repo) is a separate
+implementation and does **not** load this bundle — no UI code is shared between
+them today. The shell's job is to open and supervise the SSH tunnel and add
+tray presence. Builds: macOS universal (Intel + Apple Silicon) and
 Windows (via GitHub Actions — Tauri cannot cross-compile a Windows bundle from a Mac).
 
 → **[hue913/council-agent](https://github.com/hue913/council-agent)**

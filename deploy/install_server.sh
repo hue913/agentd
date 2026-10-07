@@ -38,6 +38,17 @@ rsync -a --delete \
   --exclude '.pytest_cache' --exclude 'data' \
   "$SRC_DIR/" "$INSTALL_DIR/"
 
+say "console UI -> $DATA_DIR/ui"
+# /var/lib/agentd/ui is the deployed copy of the repo's ui/ folder: agentd
+# serves it at "/" (via AGENTD_UI_DIR). It is a copy, not the source of truth
+# -- edit ui/ in the repo and re-run this script (or rsync) to update it.
+if [ -d "$SRC_DIR/ui" ]; then
+  mkdir -p "$DATA_DIR/ui"
+  rsync -a --delete "$SRC_DIR/ui/" "$DATA_DIR/ui/"
+else
+  echo "WARN: no ui/ in $SRC_DIR -- console will 404 until it is installed"
+fi
+
 say "venv + deps"
 cd "$INSTALL_DIR"
 uv venv --python 3.11 .venv
