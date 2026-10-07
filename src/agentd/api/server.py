@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import time
+from pathlib import Path
 
 from . import ops
 from ..context import compact_observation
@@ -36,6 +37,14 @@ except ImportError as exc:  # pragma: no cover
 # cannot wedge systemd's supervision.
 API_TOKEN_ENV = "AGENTD_API_TOKEN"
 PUBLIC_PATHS = {"/healthz"}
+# Everything the token protects. The rule is allow-list by surface, not
+# deny-list by route: the console's <script src> and <link> requests cannot
+# carry an Authorization header, so requiring the token for static assets would
+# ship a console that renders as a blank page. Anything that is not API --
+# i.e. the UI shell, its vendored xterm bundle, and unknown SPA routes -- is
+# served without a token, and is still bounded by the UI router's own path and
+# extension checks.
+PROTECTED_PREFIXES = ("/api/", "/events")
 
 
 class AuthNotConfigured(RuntimeError):
@@ -69,8 +78,11 @@ def require_auth(conn: HTTPConnection) -> None:
     """
     if isinstance(conn, WebSocket):
         return
-    if conn.url.path in PUBLIC_PATHS:
+    path = conn.url.path
+    if path in PUBLIC_PATHS:
         return
+    if not any(path.startswith(prefix) for prefix in PROTECTED_PREFIXES):
+        return  # console shell / static asset, not part of the protected surface
     expected = server_token()
     if not expected:
         raise HTTPException(
@@ -236,10 +248,27 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
 
     @app.get("/", response_class=HTMLResponse)
     def index():
+        # Route order matters: this handler is declared before the console
+        # router, so it would otherwise shadow "/" and the console would never
+        # load. Fall back to the placeholder only when the console is absent.
+        ui_index = Path(os.environ.get("AGENTD_UI_DIR", "/var/lib/agentd/ui")) / "index.html"
+        if ui_index.is_file():
+            return HTMLResponse(ui_index.read_text(encoding="utf-8"))
         return _PLACEHOLDER_PAGE
 
     # The ops router needs the runtime's PTY hub and the API token, so it is
     # wired after the app exists rather than built from a module-level import.
+    # The console is served from the same origin as the API on purpose: the PTY
+    # is a WebSocket and every fetch is relative, so a separate origin would
+    # mean CORS plus a second place for the token to live.
+    ui_root = Path(os.environ.get("AGENTD_UI_DIR", "/var/lib/agentd/ui"))
+    if ui_root.is_dir():
+        from .ui import make_ui_router
+
+        ui_router = make_ui_router(ui_root)
+        if ui_router is not None:
+            app.include_router(ui_router)
+
     ops.STATE["pty"] = rt.pty
     ops.STATE["screen"] = rt.screen
     ops.STATE["screen_actions"] = rt.screen_actions

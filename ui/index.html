@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Council Agent</title>
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span class="dot" id="conn-dot" title="connection"></span>
+    <strong>Council Agent</strong>
+    <span class="sub" id="conn-text">connecting…</span>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button data-view="council" class="on">圆桌会</button>
+    <button data-view="terminal">终端</button>
+    <button data-view="screen">画面</button>
+    <button data-view="ops">运维</button>
+    <button data-view="approvals">审批<span class="badge" id="appr-badge" hidden>0</span></button>
+  </nav>
+  <div class="right">
+    <label class="cost" title="本轮圆桌会分角色 token / 费用">成本 <b id="cost-total">—</b></label>
+    <button id="btn-refresh" class="ghost" title="刷新">⟳</button>
+  </div>
+</header>
+
+<main>
+  <!-- council -->
+  <section class="view on" id="view-council">
+    <div class="council-head">
+      <input id="task-input" placeholder="交给圆桌会的问题，例如：nginx 不服务，怎么排查？">
+      <label class="chk"><input type="checkbox" id="use-council" checked> 多模型圆桌</label>
+      <button id="btn-run" class="primary">开始</button>
+    </div>
+    <div id="dissent" class="dissent" hidden>
+      <h3>未消解的分歧</h3>
+      <p class="hint">分歧不会被折叠成「已达成共识」。每一条都是需要人来判断的风险。</p>
+      <ul id="dissent-list"></ul>
+    </div>
+    <div class="cols" id="council-cols"></div>
+  </section>
+
+  <!-- terminal -->
+  <section class="view" id="view-terminal">
+    <div class="term-head">
+      <select id="pty-host"></select>
+      <input id="pty-purpose" placeholder="这次会话要做什么？（准入检查读这一项）" value="查看服务状态">
+      <button id="btn-pty-open" class="primary">打开</button>
+      <span id="pty-state" class="sub"></span>
+    </div>
+    <div id="term"></div>
+  </section>
+
+  <!-- screen -->
+  <section class="view" id="view-screen">
+    <div class="screen-head">
+      <button id="btn-grab">抓帧</button>
+      <button id="btn-auto" class="ghost">自动刷新</button>
+      <span id="screen-meta" class="sub"></span>
+      <span id="vision-state" class="tag warn"></span>
+    </div>
+    <div class="screen-wrap">
+      <div class="screen-left">
+        <img id="screen-img" alt="服务器画面">
+      </div>
+      <div class="screen-right">
+        <h3>模型看到什么</h3>
+        <pre id="observe"></pre>
+        <h3>窗口</h3>
+        <div id="windows" class="windows"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ops -->
+  <section class="view" id="view-ops">
+    <div class="ops-grid" id="ops-grid"></div>
+    <h3>进程</h3>
+    <table class="tbl" id="proc-table"><tbody></tbody></table>
+    <h3>日志</h3>
+    <select id="log-unit"></select>
+    <pre id="logs" class="logs"></pre>
+  </section>
+
+  <!-- approvals -->
+  <section class="view" id="view-approvals">
+    <div id="appr-empty" class="empty">没有待审批的请求。</div>
+    <div id="appr-list"></div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
