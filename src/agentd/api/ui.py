@@ -18,14 +18,16 @@ from pathlib import Path
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 
-# The console is a catch-all (`/{asset:path}`) so the SPA can own routing.
-# That makes it dangerous to mount before the API: it would answer any
-# unknown /api/... path with index.html and a 200. These are refused
-# explicitly so a missing route is a clean 404, never a silent HTML page.
-RESERVED_PREFIXES = ("/api/", "/events", "/healthz")
-
 ALLOWED_SUFFIXES = {".html", ".js", ".css", ".json", ".svg", ".png", ".ico", ".woff", ".woff2", ".map"}
 MAX_BYTES = 8 * 1024 * 1024
+
+# The API surface must never fall back to the SPA shell: an unknown /api/*
+# path has to answer 404 JSON, because a client that asked for an API resource
+# and received HTTP 200 with the console's HTML will parse a web page as JSON
+# and report a nonsense error far from the cause. Keep this list aligned with
+# PROTECTED_PREFIXES / PUBLIC_PATHS in server.py -- anything the API owns gets
+# a JSON answer, and only true console routes get the shell.
+API_OWNED_PREFIXES = ("api", "events", "healthz")
 
 
 def make_ui_router(root: Path):
@@ -46,11 +48,11 @@ def make_ui_router(root: Path):
 
     @router.get("/{asset:path}")
     def asset(asset: str):
-        # The path parameter arrives WITHOUT a leading slash, so comparing it
-        # against prefixes that have one never matches -- which is exactly how
-        # /api/does-not-exist came back as index.html with a 200.
-        if ("/" + asset.lstrip("/")).startswith(RESERVED_PREFIXES):
-            raise HTTPException(404, "not a console asset")
+        for prefix in API_OWNED_PREFIXES:
+            if asset == prefix or asset.startswith(prefix + "/"):
+                # 404 before the filesystem: these are not console routes even
+                # if a file with a coincidental name exists under the root.
+                raise HTTPException(404, f"no such API route: /{asset}")
         # Reject traversal before touching the filesystem. resolve() alone is
         # not enough once symlinks are in play, hence the is_relative_to check.
         candidate = (root / asset).resolve()
