@@ -1,7 +1,8 @@
 /* Council Agent console.
  *
- * One bundle, two hosts: the browser console and the Tauri shell both load this
- * file. Only the origin differs.
+ * A no-build single bundle served directly by agentd at "/" and opened in a
+ * browser over the SSH tunnel. There is no second host loading this file: the
+ * desktop shell is an independent implementation in another repo.
  *
  * The onboarding layer is not decoration. Someone opening this for the first
  * time needs to know three things in order: open the tunnel, prove who you are,
@@ -26,26 +27,57 @@
 
   /* ───────────────────────── transport ───────────────────────── */
 
-  async function api(path, opts = {}) {
+  const API_TIMEOUT_MS = 15000;
+
+  async function api(path, opts = {}, attempt = 0) {
     const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
     if (state.token) headers["Authorization"] = `Bearer ${state.token}`;
-    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    // Every call gets a hard deadline; a hung tunnel must surface as an error,
+    // not as a spinner that never resolves.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(path, Object.assign({}, opts, { headers, signal: ctrl.signal }));
+    } catch (e) {
+      // Network failure or timeout. Idempotent GETs retry once after a short
+      // backoff; mutating calls must never be replayed blindly.
+      if (attempt === 0 && (!opts.method || opts.method === "GET")) {
+        await new Promise((r) => setTimeout(r, 500));
+        return api(path, opts, attempt + 1);
+      }
+      throw new Error(e.name === "AbortError" ? "请求超时（15s）" : "网络错误");
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) {
       let detail = `${res.status}`;
       try { detail = (await res.json()).detail || detail; } catch (_) {}
-      throw new Error(detail);
+      const err = new Error(detail);
+      err.status = res.status;   // callers distinguish 404 (quiet) from real faults
+      throw err;
     }
     return res.status === 204 ? null : res.json();
   }
 
-  let toastTimer;
+  /* At most three toasts on screen at once; each stacks above the last and
+   * removes itself, so a burst of failures cannot hide earlier messages. */
+  const toastStack = [];
   function toast(msg, kind) {
-    const el = $("toast");
-    el.textContent = msg;
+    const el = document.createElement("div");
     el.className = "toast" + (kind ? " " + kind : "");
-    el.hidden = false;
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { el.hidden = true; }, 4200);
+    el.textContent = msg;
+    document.body.appendChild(el);
+    el.style.bottom = `${20 + toastStack.length * 48}px`;
+    toastStack.push(el);
+    while (toastStack.length > 3) toastStack.shift().remove();
+    setTimeout(() => {
+      const i = toastStack.indexOf(el);
+      if (i >= 0) toastStack.splice(i, 1);
+      // Re-stack the survivors so no gap is left behind.
+      toastStack.forEach((t, idx) => { t.style.bottom = `${20 + idx * 48}px`; });
+      el.remove();
+    }, 4200);
   }
 
   function conn(ok, text) {
@@ -83,14 +115,14 @@
     document.querySelectorAll("[data-copy]").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const text = $(btn.dataset.copy)?.textContent ?? "";
-        await copy(text);
-        flash(btn, "已复制");
+        if (await copy(text)) flash(btn, "已复制");
+        else toast("复制失败 —— 请手动选中复制", "bad");
       });
     });
     document.querySelectorAll("[data-copy2]").forEach((btn) => {
       btn.addEventListener("click", async () => {
-        await copy(btn.dataset.copy2);
-        flash(btn, "已复制");
+        if (await copy(btn.dataset.copy2)) flash(btn, "已复制");
+        else toast("复制失败 —— 请手动选中复制", "bad");
       });
     });
   }
@@ -98,17 +130,21 @@
   async function copy(text) {
     try {
       await navigator.clipboard.writeText(text);
+      return true;
     } catch (_) {
       // Clipboard API needs a secure context; the SSH tunnel is plain http, so
-      // fall back rather than silently doing nothing.
+      // fall back rather than silently doing nothing. The caller is told
+      // honestly whether either path worked.
       const ta = document.createElement("textarea");
       ta.value = text;
       ta.style.position = "fixed";
       ta.style.opacity = "0";
       document.body.appendChild(ta);
       ta.select();
-      try { document.execCommand("copy"); } catch (__) {}
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (__) { ok = false; }
       ta.remove();
+      return ok;
     }
   }
 
@@ -228,12 +264,43 @@
 
   /* ───────────────────────── council ───────────────────────── */
 
+  /* Generation token for the two polling chains. Starting a new session (or
+   * reaching a terminal state) bumps it; any in-flight timer whose captured
+   * generation no longer matches simply exits instead of rescheduling. This
+   * is what keeps repeated "开始" clicks from leaving permanent 1.2s/4s
+   * polling loops behind. */
+  let pollGeneration = 0;
+  let approvalsTimer = null;
+
+  function startApprovalsPolling() {
+    stopApprovalsPolling();
+    approvalsTimer = setInterval(refreshApprovals, 4000);
+  }
+
+  function stopApprovalsPolling() {
+    if (approvalsTimer !== null) { clearInterval(approvalsTimer); approvalsTimer = null; }
+  }
+
+  /* Terminal state: stop both chains and drop the session reference so the
+   * approvals view stops claiming there is something to watch. */
+  function finishSession() {
+    stopApprovalsPolling();
+    pollGeneration += 1;
+    state.session = null;
+    $("appr-badge").hidden = true;
+    $("appr-badge").textContent = "0";
+  }
+
   async function runCouncil() {
     const task = $("task-input").value.trim();
     if (!task) return toast("先写下要问的问题", "bad");
     const btn = $("btn-run");
     btn.disabled = true;
     btn.textContent = "进行中…";
+    // Any polling chain left over from a previous run is orphaned here: bump
+    // the generation so its timers exit on their next tick.
+    stopApprovalsPolling();
+    pollGeneration += 1;
     $("council-cols").innerHTML = "";
     $("council-empty").hidden = true;
     $("dissent").hidden = true;
@@ -255,7 +322,9 @@
       });
       state.session = r.session;
       toast(`已启动 · ${r.session}`);
-      pollSession();
+      const gen = ++pollGeneration;   // this run owns the new generation
+      pollSession(gen);
+      startApprovalsPolling();
     } catch (e) {
       toast("启动失败：" + e.message, "bad");
       $("council-empty").hidden = false;
@@ -265,14 +334,21 @@
     }
   }
 
-  async function pollSession() {
-    if (!state.session) return;
+  async function pollSession(gen) {
+    if (gen !== pollGeneration || !state.session) return;
     try {
       const s = await api(`api/session/${state.session}`);
-      if (s.status === "running" || s.status === "pending") return setTimeout(pollSession, 1200);
+      if (gen !== pollGeneration) return;   // superseded by a newer run
+      if (s.status === "running" || s.status === "pending") {
+        setTimeout(() => pollSession(gen), 1200);
+        return;
+      }
       renderReport(s);
+      finishSession();
     } catch (e) {
+      if (gen !== pollGeneration) return;
       toast(e.message, "bad");
+      finishSession();
     }
   }
 
@@ -314,7 +390,7 @@
         <h4>第 ${(Number(c.step) || 0) + 1} 步 · ${c.consensus ? "达成一致" : "有分歧"}</h4>
         ${rows || '<p class="muted">（这一步没有提案记录）</p>'}
         ${objs ? `<div class="objs"><b class="muted sm">质疑</b><ul class="muted sm">${objs}</ul></div>` : ""}
-        <div class="meta">裁决：${esc(c.chosen || "—")}${c.tokens ? ` · ${c.tokens} tok` : ""}</div>`;
+        <div class="meta">裁决：${esc(c.chosen || "—")}${c.tokens ? ` · ${esc(c.tokens)} tok` : ""}</div>`;
       cols.appendChild(card);
     });
 
@@ -361,13 +437,13 @@
       det.innerHTML =
         `<summary><span class="n">${(Number(t.t) || 0) + 1}</span>` +
         `<span class="act">${esc(t.chosen_action || "—")}</span>` +
-        `<span class="meta">${failed} ${t.retrieved || 0} 条召回 · ${t.duration_ms || 0}ms ` +
+        `<span class="meta">${failed} ${esc(t.retrieved || 0)} 条召回 · ${esc(t.duration_ms || 0)}ms ` +
         `${viaCouncil ? '<span class="tag ok">圆桌</span>' : '<span class="tag">单模型</span>'}</span></summary>` +
         `<div class="trace-body">` +
         `<div class="muted sm">当时的状态</div><pre>${esc(String(t.state || "").slice(0, 700))}</pre>` +
         (t.tool_output ? `<div class="muted sm">执行结果</div><pre>${esc(t.tool_output)}</pre>` : "") +
         (t.error ? `<div class="muted sm">错误</div><pre class="err">${esc(t.error)}</pre>` : "") +
-        `<div class="meta sm">优势基线 ${(+t.baseline || 0).toFixed(3)} · 探索 ${(t.explored || []).length} 项 · 风险档 ${t.risk || "—"}</div>` +
+        `<div class="meta sm">优势基线 ${(+t.baseline || 0).toFixed(3)} · 探索 ${(t.explored || []).length} 项 · 风险档 ${esc(t.risk || "—")}</div>` +
         `</div>`;
       box.appendChild(det);
     });
@@ -384,11 +460,27 @@
 
   let seats = [];
 
+  /* api/providers is fetched from two views (seat manager and council picker);
+   * share one response with a short TTL so entering the council view does not
+   * double-hit the endpoint. Saving or deleting a seat invalidates the cache. */
+  let seatsCache = null;
+  let seatsCacheAt = 0;
+  const SEATS_TTL_MS = 30000;
+
+  async function fetchSeats(force = false) {
+    if (!force && seatsCache !== null && Date.now() - seatsCacheAt < SEATS_TTL_MS) return seatsCache;
+    seatsCache = await api("api/providers");
+    seatsCacheAt = Date.now();
+    return seatsCache;
+  }
+
+  function invalidateSeats() { seatsCache = null; seatsCacheAt = 0; }
+
   async function loadSeats() {
     const box = $("seat-list");
     if (!box) return;
     try {
-      const data = await api("api/providers");
+      const data = await fetchSeats();
       seats = data.providers || [];
       if (!seats.length) {
         box.innerHTML =
@@ -483,6 +575,7 @@
       const r = await api("api/providers", { method: "POST", body: JSON.stringify(body) });
       toast(`已保存席位 ${r.name}${r.note ? " · " + r.note : ""}`, "good");
       clearSeatForm();
+      invalidateSeats();
       await loadSeats();
       await loadSeatPicker();
     } catch (e) {
@@ -498,6 +591,7 @@
     try {
       await api(`api/providers/${encodeURIComponent(name)}`, { method: "DELETE" });
       toast(`已删除 ${name}`);
+      invalidateSeats();
       await loadSeats();
       await loadSeatPicker();
     } catch (e) {
@@ -509,7 +603,7 @@
     const box = $("council-seats");
     if (!box) return;
     try {
-      const data = await api("api/providers");
+      const data = await fetchSeats();
       const list = data.providers || [];
       if (!list.length) {
         box.innerHTML = '<span class="muted sm">还没有模型 —— 去「模型」页添加任意端点（缺密钥会如实标出）。</span>';
@@ -562,15 +656,50 @@
   async function closePty() {
     if (!state.pty) return;
     try { await api(`api/pty/${state.pty}/close`, { method: "POST" }); } catch (_) {}
-    if (state.ws) { try { state.ws.close(); } catch (_) {} }
+    teardownPtyConnection();
     state.pty = null;
     $("pty-state").textContent = "未打开";
     $("term-empty").hidden = false;
     toast("终端已关闭");
   }
 
+  /* Tear down everything a previous connection owned: the socket, the resize
+   * observer's push path, and the state references. Without this, reopening a
+   * PTY would leave the old WebSocket alive and its output interleaved with
+   * the new session's. Handlers are detached first so the deliberate close
+   * does not fire the "已断开" UI path. */
+  function teardownPtyConnection() {
+    if (state.ws) {
+      const ws = state.ws;
+      ws.onopen = ws.onmessage = ws.onclose = null;
+      try { ws.close(); } catch (_) {}
+      state.ws = null;
+    }
+    if (ptyResizeObserver) {
+      try { ptyResizeObserver.disconnect(); } catch (_) {}
+    }
+  }
+
+  /* One observer for the lifetime of the page, created lazily and reused
+   * across reconnects; a fresh ResizeObserver per onopen would leak one per
+   * session. It only pushes when a live socket exists. */
+  let ptyResizeObserver = null;
+
+  function ensurePtyResizeObserver() {
+    if (ptyResizeObserver) { ptyResizeObserver.observe($("term-wrap")); return; }
+    ptyResizeObserver = new ResizeObserver(() => {
+      if (!state.ws || state.ws.readyState !== 1) return;
+      try { state.fit.fit(); } catch (_) {}
+      try { state.ws.send(JSON.stringify({ type: "resize", rows: state.term.rows, cols: state.term.cols })); } catch (_) {}
+    });
+    ptyResizeObserver.observe($("term-wrap"));
+  }
+
   function connectPty() {
     if (!state.pty) return;
+    // A previous connection may still be open (re-open without explicit
+    // close); fully tear it down before opening a new one.
+    teardownPtyConnection();
     if (!state.term) {
       state.term = new Terminal({
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -598,13 +727,13 @@
       state.term.write(new Uint8Array(ev.data));
     };
     ws.onclose = (ev) => {
+      if (state.ws === ws) state.ws = null;
       $("pty-state").textContent = ev.code === 1000 ? "已关闭" : `已断开 (${ev.code})`;
       if (ev.code === 4401) toast("令牌不对，PTY 被拒绝", "bad");
     };
     ws.onopen = () => {
-      const push = () => ws.send(JSON.stringify({ type: "resize", rows: state.term.rows, cols: state.term.cols }));
-      push();
-      new ResizeObserver(() => { try { state.fit.fit(); push(); } catch (_) {} }).observe($("term-wrap"));
+      ensurePtyResizeObserver();
+      ws.send(JSON.stringify({ type: "resize", rows: state.term.rows, cols: state.term.cols }));
     };
   }
 
@@ -621,10 +750,20 @@
         el.textContent = "未接视觉模型（只有结构性描述）";
         el.className = "tag warn";
       }
-    } catch (_) {}
+    } catch (e) {
+      // Not in the 5s grab loop (this runs once per view switch), so a plain
+      // toast is enough — but 401/network failures must not be silent.
+      toast("视觉状态检查失败：" + e.message, "bad");
+    }
   }
 
+  /* Only one grab in flight at a time: each round is three serial requests,
+   * and an overlapping round would reorder frames and thrash the backend. */
+  let grabInFlight = false;
+
   async function grabFrame() {
+    if (grabInFlight) return;
+    grabInFlight = true;
     try {
       const f = await api("api/screen/frame");
       $("screen-img").src = `api/screen/frame.jpg?t=${f.ts}`;
@@ -640,10 +779,12 @@
 
       const w = await api("api/screen/windows");
       $("windows").innerHTML = (w.windows || [])
-        .map((x) => `<div>${esc(x.name || "(无名窗口)")} · ${x.w}×${x.h} @ (${x.x},${x.y})</div>`)
+        .map((x) => `<div>${esc(x.name || "(无名窗口)")} · ${esc(x.w)}×${esc(x.h)} @ (${esc(x.x)},${esc(x.y)})</div>`)
         .join("") || '<span>画面上没有窗口</span>';
     } catch (e) {
       toast("抓帧失败：" + e.message, "bad");
+    } finally {
+      grabInFlight = false;
     }
   }
 
@@ -680,7 +821,7 @@
 
       $("proc-table").querySelector("tbody").innerHTML = (snap.processes || [])
         .map((p) => `<tr><td>${esc(p.comm)}</td><td>${(p.rss_kb / 1024).toFixed(1)} MB</td>` +
-                    `<td>${p.cpu_pct}%</td><td>${uptime(p.etime_s)}</td></tr>`)
+                    `<td>${esc(p.cpu_pct)}%</td><td>${uptime(p.etime_s)}</td></tr>`)
         .join("") || '<tr><td colspan="4" class="muted">—</td></tr>';
     } catch (e) {
       toast("运维数据拉取失败：" + e.message, "bad");
@@ -698,14 +839,14 @@
         return;
       }
       const head = `<div class="muted sm" style="margin-bottom:8px">` +
-        `召回 ${t.recalls} 次 · 采纳 ${t.adopted} · 否决 ${t.rejected} · ` +
+        `召回 ${esc(t.recalls)} 次 · 采纳 ${esc(t.adopted)} · 否决 ${esc(t.rejected)} · ` +
         `采纳率 <b>${((t.adoption_rate ?? 0) * 100).toFixed(1)}%</b></div>`;
       box.innerHTML = head + (d.entries || []).map((e) => {
         const cls = e.credit >= 1 ? "up" : "down";
         return `<div class="credit-row"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">` +
           `${esc((e.action || "").slice(0, 40))}</span>` +
           `<span class="credit-val ${cls}">×${(+e.credit).toFixed(2)}</span>` +
-          `<span class="muted">${e.adopted}/${e.rejected}</span></div>`;
+          `<span class="muted">${esc(e.adopted)}/${esc(e.rejected)}</span></div>`;
       }).join("");
     } catch (e) {
       box.textContent = "拉取失败：" + e.message;
@@ -724,6 +865,10 @@
   }
 
   /* ───────────────────────── approvals ───────────────────────── */
+
+  /* Throttle for the "审批列表不可达" toast: the 4s poll would otherwise
+   * spam one toast per tick while the tunnel is down. */
+  let apprErrorShown = false;
 
   async function refreshApprovals() {
     if (!state.session) return;
@@ -755,7 +900,17 @@
         no.onclick = () => decide(p.token, false, el);
         list.appendChild(el);
       });
-    } catch (_) { /* session not started yet is not an error */ }
+    } catch (e) {
+      // A 404 just means the session is not queryable (not started, already
+      // reaped) -- quiet is correct there. Anything else (401, network,
+      // timeout) is a real fault and gets told to the user, but throttled so
+      // the 4s poll cannot flood the screen.
+      if (e.status === 404) return;
+      if (apprErrorShown) return;
+      apprErrorShown = true;
+      toast("审批列表不可达：" + e.message, "bad");
+      setTimeout(() => { apprErrorShown = false; }, 15000);
+    }
   }
 
   async function decide(token, approved, el) {
@@ -765,6 +920,12 @@
       toast(approved ? "已允许执行" : "已拒绝", approved ? "good" : "");
     } catch (e) {
       toast("审批失败：" + e.message, "bad");
+      // The request is still pending on the server; putting the entry back at
+      // the head of the list keeps the UI honest instead of pretending the
+      // decision went through.
+      const list = $("appr-list");
+      if (list) list.insertBefore(el, list.firstChild);
+      else refreshApprovals();
     }
   }
 
@@ -782,7 +943,8 @@
     $("btn-refresh").onclick = async () => { await loadState(); refreshOps(); loadSeatPicker(); };
     $("btn-seat-save").onclick = saveSeat;
     $("btn-seat-clear").onclick = clearSeatForm;
-    $("btn-seat-reload").onclick = loadSeats;
+    // The explicit 刷新 button must bypass the 30s seats cache.
+    $("btn-seat-reload").onclick = () => { invalidateSeats(); loadSeats(); };
     $("btn-seat-manage").onclick = () => goto("models");
     $("log-unit").onchange = loadLogs;
     $("btn-auto").onclick = () => {
@@ -791,7 +953,11 @@
         state.auto = null;
         $("btn-auto").textContent = "自动刷新";
       } else {
-        state.auto = setInterval(grabFrame, 5000);
+        // Each tick is three serial requests; skip the tick entirely unless
+        // the screen view is visible, and grabFrame skips overlapping rounds.
+        state.auto = setInterval(() => {
+          if ($("view-screen").classList.contains("on")) grabFrame();
+        }, 5000);
         $("btn-auto").textContent = "停止自动";
       }
     };
@@ -813,7 +979,17 @@
       }
     });
 
-    setInterval(refreshApprovals, 4000);
+    // Approvals polling is bound to a live session (started in runCouncil,
+    // stopped in finishSession) -- a permanent interval here would keep
+    // hitting a dead session forever.
+
+    // Leaving the page: close the PTY socket and stop every timer we own so
+    // the server sees a clean disconnect.
+    window.addEventListener("beforeunload", () => {
+      teardownPtyConnection();
+      if (state.auto !== null) { clearInterval(state.auto); state.auto = null; }
+      stopApprovalsPolling();
+    });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

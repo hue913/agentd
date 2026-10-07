@@ -3,6 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- Minimal CSP matching the current asset situation:
+  * all scripts are external local files (no inline <script>, no inline
+    handlers), so script-src inherits default-src 'self' -- no 'unsafe-inline';
+  * style-src needs 'unsafe-inline' because the app and its JS templates set
+    inline style="" attributes on elements;
+  * images are same-origin frames only; connect-src 'self' also covers the
+    same-host PTY WebSocket; form-action/base-uri are cheap hardening. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'self'">
 <title>Council Agent</title>
 <link rel="stylesheet" href="vendor/xterm.css">
 <link rel="stylesheet" href="app.css">
@@ -275,7 +284,11 @@
   </section>
 </main>
 
-<div id="toast" class="toast" hidden></div>
+<!-- Toasts are created dynamically by app.js and appended to <body>, so no
+     static node is needed here. -->
+<!-- Vendored scripts are plain same-origin local files served by agentd; SRI
+     is meaningless without a third-party origin and would break on every
+     vendor update. -->
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script src="app.js"></script>
