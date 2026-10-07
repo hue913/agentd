@@ -16,7 +16,13 @@ from .envs.ops_tasks import BUILTIN_TASKS
 from .envs.ssh_env import HostSpec, SSHHub
 from .kernel import JitRLKernel, Store
 from .loop import AgentLoop, LoopConfig
-from .providers import DecodeMode, OpenAICompatProvider, ProviderSpec, probe_capabilities
+from .providers import (
+    NATIVE_PROVIDERS,
+    DecodeMode,
+    OpenAICompatProvider,
+    ProviderSpec,
+    probe_capabilities,
+)
 from .safety.audit import AuditLog
 from .toolbus import ToolBus, load_plugin_dir, load_skill_dir, register_builtins, register_mcp_server
 from .toolbus.mcp_client import MCPServerStdio
@@ -64,7 +70,18 @@ class Runtime:
                 if "api_key_env" in spec else spec.get("api_key", "")
             if "decode_mode" in merged and isinstance(merged["decode_mode"], str):
                 merged["decode_mode"] = DecodeMode(merged["decode_mode"])
-            out[name] = OpenAICompatProvider(ProviderSpec(**merged))
+            kind = merged.get("kind") or "openai_compat"
+            if kind in NATIVE_PROVIDERS:
+                # Native protocols carry no logprobs; the class pins its own tier.
+                merged["decode_mode"] = DecodeMode.VERBALIZED
+                out[name] = NATIVE_PROVIDERS[kind](ProviderSpec(**merged))
+            elif kind != "openai_compat":
+                raise ValueError(
+                    f"provider '{name}': unknown kind '{kind}'. "
+                    f"known: openai_compat, {', '.join(sorted(NATIVE_PROVIDERS))}"
+                )
+            else:
+                out[name] = OpenAICompatProvider(ProviderSpec(**merged))
         return out
 
     def default_provider(self, name: str = ""):

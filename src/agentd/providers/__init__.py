@@ -3,10 +3,12 @@ from .base import (
 )
 from .capability import Capabilities, clear_cache, probe_capabilities
 from .mock import MockProvider
+from .native import NATIVE_PROVIDERS, AnthropicProvider, GeminiProvider
 from .openai_compat import OpenAICompatProvider, extract_candidate_scores
 
 __all__ = [
-    "Capabilities", "Choice", "DecodeMode", "MockProvider", "OpenAICompatProvider",
-    "Provider", "ProviderError", "ProviderSpec", "ScoreSpace", "Usage",
+    "AnthropicProvider", "Capabilities", "Choice", "DecodeMode", "GeminiProvider",
+    "MockProvider", "NATIVE_PROVIDERS", "OpenAICompatProvider", "Provider",
+    "ProviderError", "ProviderSpec", "ScoreSpace", "Usage",
     "clear_cache", "extract_candidate_scores", "probe_capabilities",
 ]

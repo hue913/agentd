@@ -64,9 +64,24 @@ def _headers(spec: ProviderSpec) -> dict:
 
 
 def probe_capabilities(spec: ProviderSpec, use_cache: bool = True, timeout: int = 30) -> Capabilities:
-    key = (spec.base_url, spec.model)
+    # The cache key must include the protocol. Two specs can share a model name
+    # while speaking different wire formats, and a stale hit would report one
+    # endpoint's capabilities for the other's.
+    key = (spec.kind, spec.base_url, spec.model)
     if use_cache and key in _CACHE:
         return _CACHE[key]
+
+    if spec.kind != "openai_compat":
+        # The probe below is an OpenAI-shaped request (logprobs + top_logprobs
+        # against /v1/chat/completions). Sending it to Anthropic Messages or
+        # Gemini generateContent produced "unknown url type: '/v1/chat/completions'"
+        # because native providers carry no base_url. Those protocols have no
+        # logprobs to discover, so the tier is known a priori.
+        caps = Capabilities(model=spec.model, label=spec.label)
+        caps.decode_mode = DecodeMode.VERBALIZED
+        caps.notes = f"kind={spec.kind}: native protocol exposes no logprobs; tier is fixed"
+        _CACHE[key] = caps
+        return caps
 
     caps = Capabilities(model=spec.model, label=spec.label)
     payload = {
