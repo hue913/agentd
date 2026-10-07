@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -16,6 +17,9 @@ from agentd.api import create_app
 from agentd.runtime import Runtime
 
 
+TEST_TOKEN = "test-token-not-a-real-secret"
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -24,6 +28,11 @@ def free_port() -> int:
 
 @pytest.fixture()
 def server(tmp_path):
+    # The API is fail-closed: with no AGENTD_API_TOKEN it returns 503 for every
+    # protected route. The suite therefore has to arm a token, exactly as the
+    # deployed systemd unit does.
+    previous = os.environ.get("AGENTD_API_TOKEN")
+    os.environ["AGENTD_API_TOKEN"] = TEST_TOKEN
     runtime = Runtime({"db": str(tmp_path / "api.db"), "kernel": {"gamma": 0.5}})
     port = free_port()
     uv = uvicorn.Server(uvicorn.Config(create_app(runtime), host="127.0.0.1", port=port,
@@ -41,11 +50,16 @@ def server(tmp_path):
     uv.should_exit = True
     thread.join(timeout=5)
     runtime.close()
+    if previous is None:
+        os.environ.pop("AGENTD_API_TOKEN", None)
+    else:
+        os.environ["AGENTD_API_TOKEN"] = previous
 
 
 def get(url: str) -> tuple[int, object]:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TEST_TOKEN}"})
     try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read().decode()
             return resp.status, (json.loads(body) if body[:1] in "{[" else body)
     except urllib.error.HTTPError as exc:
@@ -58,7 +72,8 @@ def get(url: str) -> tuple[int, object]:
 
 def post(url: str, payload: dict) -> tuple[int, object]:
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {TEST_TOKEN}"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = resp.read().decode()
@@ -166,7 +181,75 @@ def test_approve_unknown_token_is_404(server):
 
 def test_sse_stream_opens_with_hello(server):
     base, _ = server
-    with urllib.request.urlopen(f"{base}/events", timeout=15) as resp:
+    with urllib.request.urlopen(f"{base}/events?token={TEST_TOKEN}", timeout=15) as resp:
         first = resp.readline().decode()
     assert first.startswith("data:")
     assert json.loads(first[5:].strip())["type"] == "hello"
+
+
+def test_healthz_stays_public(server):
+    """Liveness must not require a token, or a misconfigured token wedges systemd."""
+    base, _ = server
+    code, body = get(f"{base}/healthz")
+    assert code == 200 and body["ok"] is True
+
+
+def test_protected_routes_reject_missing_and_wrong_tokens(server):
+    base, _ = server
+    for url in (f"{base}/api/state", f"{base}/api/tools", f"{base}/api/risks",
+                f"{base}/api/audit", f"{base}/api/memory"):
+        req = urllib.request.Request(url)
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            raise AssertionError(f"{url} served without a token")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, (url, exc.code)
+
+        bad = urllib.request.Request(url, headers={"Authorization": "Bearer wrong"})
+        try:
+            urllib.request.urlopen(bad, timeout=10)
+            raise AssertionError(f"{url} served a wrong token")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, (url, exc.code)
+
+
+def test_ssh_exec_is_not_reachable_without_a_token(server):
+    base, _ = server
+    req = urllib.request.Request(
+        f"{base}/api/ssh/exec", data=json.dumps({"host": "x", "command": "id"}).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        raise AssertionError("ssh exec reached without a token")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401
+
+
+def test_missing_server_token_fails_closed(tmp_path):
+    """No configured token must NOT mean open access -- it must mean 503."""
+    previous = os.environ.pop("AGENTD_API_TOKEN", None)
+    try:
+        port = free_port()
+        uv = uvicorn.Server(uvicorn.Config(create_app(Runtime({"db": str(tmp_path / "nc.db")})),
+                                           host="127.0.0.1", port=port,
+                                           log_level="error", lifespan="off"))
+        thread = threading.Thread(target=uv.run, daemon=True)
+        thread.start()
+        for _ in range(80):
+            if uv.started:
+                break
+            time.sleep(0.05)
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10) as resp:
+                assert resp.status == 200
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=10)
+                raise AssertionError("served unauthenticated with no token configured")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 503
+        finally:
+            uv.should_exit = True
+            thread.join(timeout=5)
+    finally:
+        if previous is not None:
+            os.environ["AGENTD_API_TOKEN"] = previous

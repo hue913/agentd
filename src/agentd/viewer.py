@@ -59,15 +59,20 @@ if command -v openbox >/dev/null 2>&1; then
     DISPLAY=:99 start openbox "$RUN/wm.pid" openbox
 fi
 
-AUTH_ARGS="-nopw"
-AUTH_NOTE="auth=none(loopback+tunnel only)"
 PASSFILE=/root/.agentd-vnc.pass
 if [ -n "${AGENTD_VNC_PASS:-}" ]; then
     x11vnc -storepasswd "$AGENTD_VNC_PASS" "$PASSFILE" >/dev/null 2>&1 || true
-    if [ -s "$PASSFILE" ]; then
-        AUTH_ARGS="-rfbauth $PASSFILE"
-        AUTH_NOTE="auth=password"
-    fi
+fi
+# A pre-existing passfile counts as configured. Previously only the env var
+# armed the password, so ANY restart without AGENTD_VNC_PASS silently fell back
+# to a passwordless screen -- a latent hole, since the passfile was still there.
+if [ -s "$PASSFILE" ]; then
+    AUTH_ARGS="-rfbauth $PASSFILE"
+    AUTH_NOTE="auth=password($PASSFILE)"
+else
+    AUTH_ARGS="-nopw"
+    AUTH_NOTE="auth=NONE -- passwordless screen (loopback+tunnel only)"
+    echo "WARNING: $PASSFILE missing; falling back to -nopw" >&2
 fi
 if command -v x11vnc >/dev/null 2>&1; then
     start x11vnc "$RUN/x11vnc.pid" x11vnc -display :99 -forever -shared -localhost -rfbport 5900 $AUTH_ARGS

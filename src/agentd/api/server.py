@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import os
 import time
 
 from ..context import compact_observation
@@ -11,17 +13,72 @@ from ..kernel.pack import diff_packs, export_pack, import_pack, load_pack, to_ma
 from ..runtime import Runtime
 
 try:
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import Depends, FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError("install the api extra: pip install 'agentd[api]'") from exc
+
+
+# --- auth -------------------------------------------------------------------
+# The service binds loopback, so loopback alone is NOT a security boundary: any
+# `ssh -L 8765:127.0.0.1:8765` turns every route into a remotely reachable one,
+# including /api/ssh/exec. A bearer token closes that hole.
+#
+# Fail-closed: if the server has no token configured, protected routes return
+# 503 instead of serving unauthenticated. Silently running open was the previous
+# behaviour and it is the bug this block exists to fix.
+#
+# /healthz is deliberately left open: it is a liveness probe, exposes no
+# credentials or commands, and keeping it open means a misconfigured token
+# cannot wedge systemd's supervision.
+API_TOKEN_ENV = "AGENTD_API_TOKEN"
+PUBLIC_PATHS = {"/healthz"}
+
+
+class AuthNotConfigured(RuntimeError):
+    pass
+
+
+def server_token() -> str:
+    return os.environ.get(API_TOKEN_ENV, "").strip()
+
+
+def _presented(request) -> str:
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    alt = request.headers.get("x-agentd-token", "")
+    if alt.strip():
+        return alt.strip()
+    # EventSource cannot set headers, so the SSE stream has to carry the token
+    # in the query string. Only honoured for that reason; browsers cannot attach
+    # headers to EventSource at all.
+    return request.query_params.get("token", "").strip()
+
+
+def require_auth(request: Request) -> None:
+    path = request.url.path
+    if path in PUBLIC_PATHS:
+        return
+    expected = server_token()
+    if not expected:
+        raise HTTPException(
+            503,
+            f"{API_TOKEN_ENV} is not set on the server; refusing to serve protected "
+            "routes unauthenticated. Set it in the systemd unit / EnvironmentFile.",
+        )
+    got = _presented(request)
+    if not got or not hmac.compare_digest(got, expected):
+        raise HTTPException(401, "missing or invalid bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
 
 
 def create_app(runtime: Runtime | None = None) -> "FastAPI":
     rt = runtime or Runtime()
     app = FastAPI(title="agentd", version="0.1.0",
                   description="Test-time-RL agent kernel with pluggable models, SSH tools, "
-                              "plugins/skills/MCP and a live server view.")
+                              "plugins/skills/MCP and a live server view.",
+                  dependencies=[Depends(require_auth)])
 
     @app.get("/healthz")
     def healthz():
