@@ -8,12 +8,15 @@ import json
 import os
 import time
 
+from . import ops
 from ..context import compact_observation
 from ..kernel.pack import diff_packs, export_pack, import_pack, load_pack, to_markdown
 from ..runtime import Runtime
 
 try:
     from fastapi import Depends, FastAPI, HTTPException, Request
+    from starlette.requests import HTTPConnection
+    from starlette.websockets import WebSocket
     from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError("install the api extra: pip install 'agentd[api]'") from exc
@@ -43,22 +46,30 @@ def server_token() -> str:
     return os.environ.get(API_TOKEN_ENV, "").strip()
 
 
-def _presented(request) -> str:
-    header = request.headers.get("authorization", "")
+def _presented(conn) -> str:
+    header = conn.headers.get("authorization", "")
     if header.lower().startswith("bearer "):
         return header[7:].strip()
-    alt = request.headers.get("x-agentd-token", "")
+    alt = conn.headers.get("x-agentd-token", "")
     if alt.strip():
         return alt.strip()
-    # EventSource cannot set headers, so the SSE stream has to carry the token
-    # in the query string. Only honoured for that reason; browsers cannot attach
-    # headers to EventSource at all.
-    return request.query_params.get("token", "").strip()
+    # EventSource and the browser WebSocket API cannot set headers, so those two
+    # transports have to carry the token in the query string.
+    return conn.query_params.get("token", "").strip()
 
 
-def require_auth(request: Request) -> None:
-    path = request.url.path
-    if path in PUBLIC_PATHS:
+def require_auth(conn: HTTPConnection) -> None:
+    """App-level guard.
+
+    Takes HTTPConnection, not Request, because the app-level dependency list
+    also applies to WebSocket routes -- a Request-typed parameter made every
+    handshake fail with "missing 1 required positional argument". Raising
+    HTTPException inside a WebSocket scope is also not expressible, so upgrade
+    paths authenticate inside the route itself, where a 4401 close code is.
+    """
+    if isinstance(conn, WebSocket):
+        return
+    if conn.url.path in PUBLIC_PATHS:
         return
     expected = server_token()
     if not expected:
@@ -67,7 +78,7 @@ def require_auth(request: Request) -> None:
             f"{API_TOKEN_ENV} is not set on the server; refusing to serve protected "
             "routes unauthenticated. Set it in the systemd unit / EnvironmentFile.",
         )
-    got = _presented(request)
+    got = _presented(conn)
     if not got or not hmac.compare_digest(got, expected):
         raise HTTPException(401, "missing or invalid bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
@@ -226,6 +237,12 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
     @app.get("/", response_class=HTMLResponse)
     def index():
         return _PLACEHOLDER_PAGE
+
+    # The ops router needs the runtime's PTY hub and the API token, so it is
+    # wired after the app exists rather than built from a module-level import.
+    ops.STATE["pty"] = rt.pty
+    ops.STATE["token"] = server_token()
+    app.include_router(ops.router)
 
     return app
 

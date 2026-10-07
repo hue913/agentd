@@ -55,6 +55,11 @@ class Runtime:
 
         self.vnc_tokens = TokenVault()
         self.ssh = SSHHub(audit=self.audit, approver=self._ask_human)
+        from .envs.pty_env import PTYHub
+
+        # Interactive shells are a separate capability from batch exec, with
+        # their own admission check and their own reaper.
+        self.pty = PTYHub(self.ssh, audit=self.audit)
         for host in self.config.get("ssh_hosts", []):
             self.ssh.add_host(HostSpec(**host))
         self.providers = self._build_providers()
