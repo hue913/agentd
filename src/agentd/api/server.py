@@ -144,9 +144,16 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
         session = rt.sessions.get(session_id)
         if session is None:
             raise HTTPException(404, "no such session")
+        # The console renders an approval from its payload (command, reasons,
+        # level): returning bare tokens made every pending card show an empty
+        # command box. Never expose the waiter -- only what a human must read.
+        pending = []
+        for record in session.pending_approvals.values():
+            entry = {"token": record.get("token", ""), "decided": record.get("decided")}
+            entry.update(record.get("payload") or {})
+            pending.append(entry)
         return {"id": session.id, "task": session.task, "status": session.status,
-                "report": session.report,
-                "pending_approvals": list(session.pending_approvals)}
+                "report": session.report, "pending_approvals": pending}
 
     @app.post("/api/approve")
     def approve(body: dict):
