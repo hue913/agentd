@@ -33,6 +33,10 @@ def server(tmp_path):
     # deployed systemd unit does.
     previous = os.environ.get("AGENTD_API_TOKEN")
     os.environ["AGENTD_API_TOKEN"] = TEST_TOKEN
+    # Provider management writes the config file: point it at the tmp dir so a
+    # test can never touch the operator's real ~/.config/agentd/agentd.json.
+    previous_cfg = os.environ.get("AGENTD_CONFIG")
+    os.environ["AGENTD_CONFIG"] = str(tmp_path / "agentd.json")
     runtime = Runtime({"db": str(tmp_path / "api.db"), "kernel": {"gamma": 0.5}})
     port = free_port()
     uv = uvicorn.Server(uvicorn.Config(create_app(runtime), host="127.0.0.1", port=port,
@@ -54,6 +58,10 @@ def server(tmp_path):
         os.environ.pop("AGENTD_API_TOKEN", None)
     else:
         os.environ["AGENTD_API_TOKEN"] = previous
+    if previous_cfg is None:
+        os.environ.pop("AGENTD_CONFIG", None)
+    else:
+        os.environ["AGENTD_CONFIG"] = previous_cfg
 
 
 def get(url: str) -> tuple[int, object]:
@@ -76,6 +84,21 @@ def post(url: str, payload: dict) -> tuple[int, object]:
                                           "Authorization": f"Bearer {TEST_TOKEN}"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode()
+            return resp.status, (json.loads(body) if body[:1] in "{[" else body)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode()
+        try:
+            return exc.code, json.loads(raw)
+        except ValueError:
+            return exc.code, raw
+
+
+def delete(url: str) -> tuple[int, object]:
+    req = urllib.request.Request(url, method="DELETE",
+                                 headers={"Authorization": f"Bearer {TEST_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read().decode()
             return resp.status, (json.loads(body) if body[:1] in "{[" else body)
     except urllib.error.HTTPError as exc:
@@ -253,3 +276,83 @@ def test_missing_server_token_fails_closed(tmp_path):
     finally:
         if previous is not None:
             os.environ["AGENTD_API_TOKEN"] = previous
+
+
+# --- model seats -----------------------------------------------------------
+
+def test_provider_seats_crud_and_config_persistence(server, tmp_path):
+    base, _ = server
+    code, body = get(f"{base}/api/providers")
+    assert code == 200 and body["providers"] == []
+
+    code, body = post(f"{base}/api/providers", {
+        "name": "lab", "kind": "openai_compat", "model": "qwen3-8b",
+        "base_url": "http://127.0.0.1:9/v1", "tier": "cheap",
+        "api_key_env": "AGENTD_LAB_KEY"})
+    assert code == 200, body
+    assert body["name"] == "lab" and "api_key" not in body
+
+    code, body = get(f"{base}/api/providers")
+    assert [p["name"] for p in body["providers"]] == ["lab"]
+    seat = body["providers"][0]
+    assert seat["key_env"] == "AGENTD_LAB_KEY"
+    assert seat["key_present"] is False, "env var is not set, the seat must say so"
+    assert body["default_provider"] == "lab"
+
+    cfg = json.loads((tmp_path / "agentd.json").read_text())
+    assert cfg["providers"]["lab"]["model"] == "qwen3-8b"
+    assert cfg["default_provider"] == "lab"
+
+    code, body = delete(f"{base}/api/providers/lab")
+    assert code == 200 and body["removed"] == "lab"
+    code, body = get(f"{base}/api/providers")
+    assert body["providers"] == []
+
+
+def test_provider_upsert_validates_input(server):
+    base, _ = server
+    for payload, needle in (
+        ({"name": "x", "kind": "weird", "model": "m"}, "unknown kind"),
+        ({"name": "bad name!", "model": "m"}, "name must start"),
+        ({"name": "ok", "kind": "openai_compat", "model": "m"}, "base_url"),
+        ({"name": "ok", "kind": "openai_compat", "model": "", "base_url": "https://x/v1"}, "model"),
+    ):
+        code, body = post(f"{base}/api/providers", payload)
+        assert code == 400, (payload, code, body)
+        assert needle in str(body), (payload, body)
+
+
+def test_provider_delete_unknown_is_404(server):
+    base, _ = server
+    code, _ = delete(f"{base}/api/providers/ghost")
+    assert code == 404
+
+
+def test_ops_session_needs_a_model_and_refuses_an_empty_goal(server):
+    base, _ = server
+    code, body = post(f"{base}/api/session", {"task": "check the disk space", "kind": "ops"})
+    assert code == 400 and "no model configured" in str(body)
+
+    code, body = post(f"{base}/api/session", {"task": "   ", "kind": "ops", "provider": "demo"})
+    assert code == 400 and "goal" in str(body)
+
+
+def test_ops_session_runs_and_fails_honestly_without_a_usable_model(server):
+    """`demo` cannot propose tool calls; the session must say so, not fake success."""
+    base, _ = server
+    code, body = post(f"{base}/api/session", {"task": "check nginx and report",
+                                             "kind": "ops", "provider": "demo",
+                                             "max_steps": 3})
+    assert code == 200, body
+    session_id = body["session"]
+    report = None
+    for _ in range(120):
+        code, state = get(f"{base}/api/session/{session_id}")
+        assert code == 200
+        if state["status"] in ("success", "failed", "error"):
+            report = state
+            break
+        time.sleep(0.1)
+    assert report is not None
+    assert report["status"] == "failed"
+    assert "provider" in str(report["report"].get("stopped_by", ""))

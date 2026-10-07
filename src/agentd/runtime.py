@@ -38,6 +38,7 @@ class Session:
     events: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     pending_approvals: dict = field(default_factory=dict)
+    task_obj: object | None = None      # the environment this session runs
 
 
 class Runtime:
@@ -113,6 +114,118 @@ class Runtime:
             return self.providers[name]
         return self.providers[self.config.get("default_provider") or next(iter(self.providers))]
 
+    # -- provider management (config-backed, hot-reloaded) ----------------
+    _PROVIDER_KINDS = ("openai_compat", "anthropic", "gemini")
+
+    def provider_details(self) -> list[dict]:
+        raw = self.config.get("providers") or {}
+        default_name = self.config.get("default_provider") or next(iter(self.providers), "")
+        out = []
+        for name, provider in self.providers.items():
+            spec = provider.spec
+            entry = raw.get(name) or {}
+            out.append({
+                "name": name,
+                "kind": spec.kind or "openai_compat",
+                "model": spec.model,
+                "base_url": spec.base_url,
+                "tier": spec.tier,
+                "key_env": entry.get("api_key_env", ""),
+                "key_required": bool(entry.get("api_key_env") or entry.get("api_key")),
+                "key_present": bool(spec.api_key),
+                "default": name == default_name,
+            })
+        return out
+
+    def upsert_provider(self, name: str, body: dict) -> dict:
+        """Add or replace one seat, persist it, and rebuild the provider map."""
+        import re as _re
+
+        if not _re.match(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$", name or ""):
+            raise ValueError("provider name must start with a letter and use letters, digits, "
+                             "'-' or '_' (max 32 chars)")
+        kind = str(body.get("kind") or "openai_compat").strip()
+        if kind not in self._PROVIDER_KINDS:
+            raise ValueError(f"unknown kind '{kind}'. known: {', '.join(self._PROVIDER_KINDS)}")
+        model = str(body.get("model") or "").strip()
+        if not model:
+            raise ValueError("'model' is required (the model id the endpoint expects)")
+        entry: dict = {"kind": kind, "model": model}
+        base_url = str(body.get("base_url") or "").strip()
+        if kind == "openai_compat" and not base_url:
+            raise ValueError("an openai_compat provider needs a base_url (e.g. https://host/v1)")
+        if base_url:
+            entry["base_url"] = base_url
+        if body.get("api_key_env"):
+            entry["api_key_env"] = str(body["api_key_env"]).strip()
+        elif body.get("api_key"):
+            entry["api_key"] = str(body["api_key"]).strip()
+        if body.get("tier") in ("cheap", "strong"):
+            entry["tier"] = body["tier"]
+        if body.get("temperature") is not None:
+            try:
+                entry["temperature"] = float(body["temperature"])
+            except (TypeError, ValueError):
+                raise ValueError("temperature must be a number")
+
+        providers = self.config.setdefault("providers", {})
+        providers[name] = entry
+        if len(providers) == 1 or not self.config.get("default_provider"):
+            self.config["default_provider"] = name
+        self.save_config()
+        self.reload_providers()
+        out = {"name": name, **{k: v for k, v in entry.items() if k != "api_key"}}
+        if "api_key" in entry:
+            out["note"] = "key stored in plain text inside agentd.json (0600); " \
+                          "prefer api_key_env pointing at a systemd EnvironmentFile"
+        return out
+
+    def remove_provider(self, name: str) -> dict:
+        providers = self.config.get("providers") or {}
+        if name not in providers:
+            raise KeyError(name)
+        removed = providers.pop(name)
+        if self.config.get("default_provider") == name:
+            self.config["default_provider"] = next(iter(providers), "")
+        self.save_config()
+        self.reload_providers()
+        return {"removed": name, "model": removed.get("model", "")}
+
+    def probe_provider(self, name: str) -> dict:
+        provider = self.providers.get(name)
+        if provider is None:
+            raise KeyError(name)
+        try:
+            caps = probe_capabilities(provider.spec, timeout=10).as_dict()
+        except Exception as exc:
+            return {"name": name, "reachable": False,
+                    "notes": f"{type(exc).__name__}: {exc}"[:300]}
+        return {"name": name, **caps}
+
+    def reload_providers(self) -> None:
+        self.providers = self._build_providers()
+
+    def save_config(self) -> None:
+        """Persist the runtime config atomically (0600) keeping one backup.
+
+        The same file the service loads on restart, so a seat added in the UI
+        survives a reboot by construction rather than by convention.
+        """
+        path = config_path(os.environ.get("AGENTD_CONFIG"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            backup = path.with_suffix(path.suffix + ".bak")
+            try:
+                backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                os.chmod(backup, 0o600)
+            except OSError:
+                pass
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.config, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
     def _build_kernel(self, enabled: bool) -> JitRLKernel:
         cfg = self.config.get("kernel", {})
         return JitRLKernel(store=self.store, beta=float(cfg.get("beta", 1.0)),
@@ -173,22 +286,77 @@ class Runtime:
         return self._current
 
     # -- sessions ---------------------------------------------------------
-    def create_session(self, task_name: str, *, provider: str = "", learning: bool = True,
-                       max_steps: int = 12, council: bool = False) -> Session:
+    def build_task(self, task_name: str, *, kind: str = "task", host: str = ""):
+        """Resolve a session's environment.
+
+        `kind="task"` runs a scripted built-in task (measurable, closed action
+        set). `kind="ops"` runs an open goal through the tool bus -- real SSH
+        and local calls, same loop and same safety gate.
+        """
+        if kind == "ops":
+            from .envs.tool_task import ToolTask
+
+            goal = (task_name or "").strip()
+            if not goal:
+                raise ValueError("an ops session needs a goal to work on")
+            hosts = self.ssh.hosts()
+            return ToolTask(goal_text=goal, hosts=hosts,
+                            default_host=(host or (hosts[0] if hosts else "")))
+        if kind not in ("task", "auto"):
+            raise ValueError(f"unknown session kind '{kind}'. use 'task' or 'ops'")
         factory = BUILTIN_TASKS.get(task_name)
         if factory is None:
-            raise KeyError(f"unknown task '{task_name}'. available: {', '.join(sorted(BUILTIN_TASKS))}")
+            raise KeyError(
+                f"unknown task '{task_name}'. available: {', '.join(sorted(BUILTIN_TASKS))} "
+                "(or pass kind='ops' to run an open goal through the tools)")
+        return factory()
+
+    def _council_members(self, primary, requested: list[str] | None) -> list:
+        """The seats at the table.
+
+        Caller-picked names win (a typo is refused rather than silently
+        shrinking the council); otherwise the primary plus the next configured
+        providers, capped so a deliberation cannot quietly multiply token cost.
+        """
+        if requested:
+            missing = [n for n in requested if n not in self.providers]
+            if missing:
+                raise ValueError(
+                    f"unknown council member(s): {', '.join(missing)}. "
+                    f"configured: {', '.join(self.providers) or 'none'}")
+            crew = [primary]
+            for name in requested:
+                provider = self.providers[name]
+                if all(provider is not member for member in crew):
+                    crew.append(provider)
+            return crew
+        cap = max(2, int((self.config.get("council") or {}).get("max_members", 3)))
+        crew = [primary]
+        for provider in self.providers.values():
+            if len(crew) >= cap:
+                break
+            if all(provider is not member for member in crew):
+                crew.append(provider)
+        return crew
+
+    def create_session(self, task_name: str, *, provider: str = "", learning: bool = True,
+                       max_steps: int = 12, council: bool = False,
+                       members: list[str] | None = None, kind: str = "task",
+                       host: str = "") -> Session:
+        task_obj = self.build_task(task_name, kind=kind, host=host)
         model = self.default_provider(provider)
         kernel = self._build_kernel(learning)
-        members = [model] + ([p for p in self.providers.values() if p is not model][:2]
-                             if council and len(self.providers) > 1 else [])
+        crew = self._council_members(model, members) if council else [model]
+        deliberates = bool(council) and len(crew) > 1
         loop = AgentLoop(
             kernel, model, self.bus, context=ContextBuilder(), ledger=Ledger(),
-            council=Council(kernel, members, trigger=TriggerPolicy()) if council and len(members) > 1 else None,
-            config=LoopConfig(max_steps=max_steps, deliberate=bool(council and len(members) > 1)),
-            approver=self._ask_human,
+            council=Council(kernel, crew, trigger=TriggerPolicy(max_members=len(crew)))
+            if deliberates else None,
+            config=LoopConfig(max_steps=max_steps, deliberate=deliberates),
+            approver=self._ask_human, ssh=self.ssh,
         )
-        session = Session(id=uuid.uuid4().hex[:10], task=task_name, loop=loop)
+        session = Session(id=uuid.uuid4().hex[:10], task=task_name, loop=loop,
+                          task_obj=task_obj)
         self.sessions[session.id] = session
         return session
 
@@ -199,7 +367,8 @@ class Runtime:
         session.status = "running"
         self.publish({"type": "session_started", "session": session.id, "task": session.task})
         try:
-            report = session.loop.run(BUILTIN_TASKS[session.task]())
+            task = session.task_obj if session.task_obj is not None else BUILTIN_TASKS[session.task]()
+            report = session.loop.run(task)
             session.report = report.as_dict()
             session.status = "success" if report.success else "failed"
         except Exception as exc:

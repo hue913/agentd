@@ -127,13 +127,17 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
             session = rt.create_session(task, provider=body.get("provider", ""),
                                         learning=bool(body.get("learning", True)),
                                         max_steps=int(body.get("max_steps", 12)),
-                                        council=bool(body.get("council", False)))
+                                        council=bool(body.get("council", False)),
+                                        members=body.get("members") or None,
+                                        kind=str(body.get("kind", "task")),
+                                        host=str(body.get("host", "")))
         except KeyError as exc:
             raise HTTPException(404, str(exc))
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(400, str(exc))
         asyncio.create_task(asyncio.to_thread(rt.run_session, session))
-        return {"session": session.id, "task": session.task}
+        resolved = "ops" if getattr(session.task_obj, "propose_hint", None) else "task"
+        return {"session": session.id, "task": session.task, "kind": resolved}
 
     @app.get("/api/session/{session_id}")
     def get_session(session_id: str):
@@ -152,6 +156,45 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
         if not rt.resolve_approval(token, approved):
             raise HTTPException(404, "that approval request is no longer pending")
         return {"token": token, "approved": approved}
+
+    # -- model seats ------------------------------------------------------
+    # The council is not pinned to any vendor: these endpoints let the operator
+    # add any OpenAI-compatible endpoint (or a native Anthropic/Gemini seat),
+    # pick who deliberates, and check reachability before trusting a seat.
+
+    @app.get("/api/providers")
+    def providers_list():
+        return {"providers": rt.provider_details(),
+                "default_provider": rt.config.get("default_provider", ""),
+                "max_members": int((rt.config.get("council") or {}).get("max_members", 3))}
+
+    @app.post("/api/providers")
+    async def providers_upsert(body: dict):
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "body needs 'name'")
+        try:
+            return rt.upsert_provider(name, body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except OSError as exc:
+            raise HTTPException(500, f"could not write the config file: {exc}")
+
+    @app.delete("/api/providers/{name}")
+    def providers_delete(name: str):
+        try:
+            return rt.remove_provider(name)
+        except KeyError:
+            raise HTTPException(404, f"no provider named '{name}'")
+        except OSError as exc:
+            raise HTTPException(500, f"could not write the config file: {exc}")
+
+    @app.post("/api/providers/{name}/probe")
+    def providers_probe(name: str):
+        try:
+            return rt.probe_provider(name)
+        except KeyError:
+            raise HTTPException(404, f"no provider named '{name}'")
 
     @app.get("/api/memory")
     def memory(fmt: str = "json"):

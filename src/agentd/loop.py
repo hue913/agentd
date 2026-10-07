@@ -74,6 +74,8 @@ class EpisodeReport:
     analysis: str = ""
     stopped_by: str = ""
     tokens: dict = field(default_factory=dict)
+    final: str = ""            # the tool task's own answer, when it finished
+    council: list = field(default_factory=list)   # one summary per deliberated step
     started_at: float = field(default_factory=time.time)
 
     def as_dict(self) -> dict:
@@ -81,6 +83,7 @@ class EpisodeReport:
             "task": self.task, "scope": self.scope, "episode_id": self.episode_id,
             "success": self.success, "score": self.score, "analysis": self.analysis,
             "stopped_by": self.stopped_by, "steps": len(self.steps), "tokens": self.tokens,
+            "final": self.final, "council": self.council,
             "duration_s": round(time.time() - self.started_at, 2),
             "trace": [s.as_dict() for s in self.steps],
         }
@@ -119,7 +122,7 @@ class AgentLoop:
     def __init__(self, kernel: JitRLKernel, provider: Provider, bus: ToolBus,
                  context: ContextBuilder | None = None, ledger: Ledger | None = None,
                  council: Council | None = None, config: LoopConfig | None = None,
-                 approver=None, catalog_token_budget: int = 900):
+                 approver=None, catalog_token_budget: int = 900, ssh=None):
         self.kernel = kernel
         self.provider = provider
         self.bus = bus
@@ -129,6 +132,10 @@ class AgentLoop:
         self.config = config or LoopConfig()
         self.approver = approver
         self.catalog_budget = catalog_token_budget
+        # The SSH hub rides on the call context so tool handlers (ssh.exec,
+        # ssh.ls, ...) behave identically whether a call arrives from the loop
+        # or from the HTTP API.
+        self.ssh = ssh
 
     # -- candidate sourcing ----------------------------------------------
     def enumerate_candidates(self, state: str, task: Task) -> tuple[list[str], str]:
@@ -138,6 +145,14 @@ class AgentLoop:
             # it here would silently delete the action the task requires.
             return list(provided), "environment"
         prompt = (f"{state}\n\n" + PROPOSE_INSTRUCTION.format(k=self.config.propose_k))
+        hint = getattr(task, "propose_hint", "")
+        if hint:
+            # A tool-driven task proposes real calls: the model needs the tool
+            # names and the accepted action grammar in the same breath as the ask.
+            catalog = self.bus.catalog(token_budget=600, style="text")
+            if catalog:
+                prompt += "\n\nAvailable tools:\n" + catalog
+            prompt += "\n\n" + hint
         if hasattr(self.provider, "text"):
             try:
                 text, usage = self.provider.text(prompt)
@@ -216,7 +231,7 @@ class AgentLoop:
         state = task.reset()
         recorder = self.kernel.begin(task.name, task.goal())
         ctx = CallContext(session=task.name, episode_id=recorder.episode_id,
-                          approver=self.approver, kernel=self.kernel,
+                          approver=self.approver, kernel=self.kernel, ssh=self.ssh,
                           extra={"bus": self.bus})
         report = EpisodeReport(task=task.name, scope=task.scope, episode_id=recorder.episode_id)
         history: list[str] = []
@@ -244,11 +259,16 @@ class AgentLoop:
             report.steps.append(outcome.trace)
             if outcome.council_outcome is not None:
                 council_outcomes.append(outcome.council_outcome)
+                if getattr(outcome.council_outcome, "used", False):
+                    summary = outcome.council_outcome.summary()
+                    summary["step"] = outcome.trace.t
+                    report.council.append(summary)
             history.append(f"chose {decision.chosen_action} -> {outcome.trace.tool_output[:120]}")
 
             state = outcome.observation if isinstance(outcome.observation, str) else outcome.trace.state
             if outcome.done:
                 report.success, report.score = outcome.reward > 0, float(outcome.reward)
+                report.final = str(outcome.observation)[:2000]
                 break
         else:
             report.stopped_by = f"step limit ({self.config.max_steps})"

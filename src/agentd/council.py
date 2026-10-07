@@ -112,7 +112,18 @@ class Council:
         proposals: list[Proposal] = []
         usage = Usage(calls=0)
         for member in self.members[: max(self.trigger.max_members, 1)]:
-            choice = member.choose(system, user, candidates)
+            try:
+                choice = member.choose(system, user, candidates)
+            except Exception as exc:
+                # A member without a key, or with a dead endpoint, abstains --
+                # it must not take the whole deliberation down. "Not configured
+                # yet" is the normal state during rollout, and the abstention is
+                # recorded so the outcome is visibly thinner, not quietly wrong.
+                proposals.append(Proposal(
+                    member=member.label, action="", scores={},
+                    reasoning=f"unavailable: {type(exc).__name__}: {exc}"[:200],
+                    mode="unavailable"))
+                continue
             usage = usage + choice.usage
             probs = self._probabilities(choice.z)
             top = max(probs, key=probs.get) if probs else candidates[0]
@@ -167,27 +178,33 @@ class Council:
                                   scope=scope, task=task)
 
         proposals, usage = self._draft(system or state, user or state, candidates)
-        objections, usage2 = self._critique(state, proposals)
+        usable = [p for p in proposals if p.scores]
+        objections, usage2 = self._critique(state, usable)
         usage = usage + usage2
 
         weights = self.kernel.store.member_reliability(scope)
         for member in self.members:
             weights.setdefault(member.label, 0.5)      # unknown members start neutral
-        weight_total = sum(max(weights.get(p.member, 0.5), 1e-6) for p in proposals) or 1.0
+        weight_total = sum(max(weights.get(p.member, 0.5), 1e-6) for p in usable) or 1.0
 
         merged: dict[str, float] = {}
         for action in candidates:
             merged[action] = sum(weights.get(p.member, 0.5) / weight_total * p.scores.get(action, 0.0)
-                                 for p in proposals)
-        penalised = _apply_objections(merged, objections, proposals, weights, weight_total)
+                                 for p in usable)
+        penalised = _apply_objections(merged, objections, usable, weights, weight_total)
 
         adjudicated = self.kernel.decide(state, candidates, penalised, mode="council", scope=scope)
-        distinct = {p.action for p in proposals}
+        distinct = {p.action for p in usable}
         risks = [
             {"member": o.member, "against": o.target_member, "action": o.target_action,
              "stance": o.stance, "note": o.note, "severity": o.severity}
             for o in objections if o.stance == "object"
         ]
+        for p in proposals:
+            if not p.scores:
+                risks.append({"member": p.member, "against": "", "action": "",
+                              "stance": "unavailable", "note": p.reasoning or "no scores returned",
+                              "severity": "low"})
         if len(distinct) > 1:
             risks.append({"member": "council", "against": "", "action": "", "stance": "split",
                           "note": f"members disagreed: {sorted(distinct)}", "severity": "medium"})
