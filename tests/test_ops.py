@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import time
 
 import pytest
@@ -24,6 +25,23 @@ from agentd import sysinfo
 from agentd.envs.pty_env import _Ring, PTYHub, PTYRefused, PTYSession
 from agentd.envs.ssh_env import HostSpec, SSHHub
 from agentd.safety.audit import AuditLog
+
+# Interactive-session tests need a live `ssh root@127.0.0.1`: without a key the
+# spawned ssh exits at once, so any assertion on liveness would fail on a dev
+# laptop -- and pass for the wrong reason if we tolerated it. The server (the
+# deployment target) carries /root/.ssh/agentd_self_ed25519 and runs these.
+_SSH_SELF_KEY = "/root/.ssh/agentd_self_ed25519"
+requires_ssh_self = pytest.mark.skipif(
+    not os.path.exists(_SSH_SELF_KEY),
+    reason=f"no live ssh-to-self (missing {_SSH_SELF_KEY}); run on the server or install the key",
+)
+
+# sysinfo reads /proc, systemctl and journalctl by contract -- the ops panel is
+# for the Linux server, not for the host that happens to be running the tests.
+requires_linux = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="reads /proc + systemd + journalctl; the ops panel targets the Linux server",
+)
 
 
 # --- ring buffer -----------------------------------------------------------
@@ -71,6 +89,7 @@ def test_destructive_purpose_is_refused_before_any_shell_exists(hub):
     assert "block" in levels
 
 
+@requires_ssh_self
 def test_benign_purpose_is_admitted(hub):
     pty_hub, _, _ = hub
     session = pty_hub.open("self", purpose="read the nginx status page")
@@ -100,6 +119,7 @@ def test_geometry_is_clamped_to_something_a_terminal_accepts(hub, rows, cols):
         pty_hub.close(session.id)
 
 
+@requires_ssh_self
 def test_session_survives_a_real_command_and_reports_activity(hub):
     pty_hub, _, _ = hub
     session = pty_hub.open("self", purpose="run one command", rows=30, cols=100)
@@ -117,6 +137,7 @@ def test_session_survives_a_real_command_and_reports_activity(hub):
         pty_hub.close(session.id)
 
 
+@requires_ssh_self
 def test_digest_carries_no_typed_bytes(hub):
     """Audit must not become a place secrets end up."""
     pty_hub, _, _ = hub
@@ -144,6 +165,7 @@ def test_closing_a_session_stops_the_child(hub):
     assert session.id not in pty_hub.sessions
 
 
+@requires_ssh_self
 def test_idle_sessions_are_reaped(hub):
     """A client that vanishes mid-session must not leave a root shell on the box."""
     pty_hub, _, _ = hub
@@ -155,6 +177,7 @@ def test_idle_sessions_are_reaped(hub):
     assert pty_hub.sessions == {}
 
 
+@requires_ssh_self
 def test_reaper_leaves_live_sessions_alone(hub):
     pty_hub, _, _ = hub
     session = pty_hub.open("self", purpose="still in use")
@@ -174,6 +197,7 @@ def test_get_on_unknown_session_is_an_error(hub):
 
 # --- sysinfo ---------------------------------------------------------------
 
+@requires_linux
 def test_overview_reports_the_running_host():
     data = sysinfo.overview()
     assert data["uptime_s"] > 0
@@ -183,6 +207,7 @@ def test_overview_reports_the_running_host():
     assert root and root[0]["size"] > 0
 
 
+@requires_linux
 def test_overview_matches_proc_meminfo():
     """The panel must not drift from the kernel's own numbers."""
     data = sysinfo.overview()
@@ -201,6 +226,7 @@ def test_processes_sort_and_clamp(sort):
     assert all(r["pid"] > 0 and r["comm"] for r in rows)
 
 
+@requires_linux
 def test_services_reports_real_units():
     data = sysinfo.services()
     units = {s["unit"]: s for s in data["services"]}
@@ -215,11 +241,13 @@ def test_logs_refuses_a_unit_name_that_could_become_an_option(hostile):
     assert result["error"] == "invalid unit name"
 
 
+@requires_linux
 def test_logs_clamps_the_line_count():
     assert sysinfo.logs("agentd.service", lines=999999)["lines"] == 2000
     assert sysinfo.logs("agentd.service", lines=0)["lines"] == 1
 
 
+@requires_linux
 def test_snapshot_has_all_three_sections():
     snap = sysinfo.snapshot()
     assert set(snap) == {"overview", "processes", "services"}
