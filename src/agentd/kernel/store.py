@@ -1,0 +1,250 @@
+"""SQLite-backed episodic memory: (state, action, discounted_return) triplets."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS episodes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task        TEXT NOT NULL,
+    goal        TEXT,
+    started_at  REAL,
+    finished_at REAL,
+    success     INTEGER,
+    score       REAL,
+    analysis    TEXT,
+    meta        TEXT
+);
+CREATE TABLE IF NOT EXISTS steps (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    episode_id INTEGER REFERENCES episodes(id) ON DELETE CASCADE,
+    t          INTEGER NOT NULL,
+    state      TEXT NOT NULL,
+    state_fp   TEXT NOT NULL,
+    action     TEXT NOT NULL,
+    action_fp  TEXT NOT NULL,
+    scope      TEXT,
+    z          REAL,
+    adv        REAL,
+    z_prime    REAL,
+    chosen     INTEGER,
+    reward     REAL,
+    ret        REAL
+);
+CREATE INDEX IF NOT EXISTS steps_action_fp_idx ON steps(action_fp);
+CREATE INDEX IF NOT EXISTS steps_scope_idx     ON steps(scope);
+CREATE INDEX IF NOT EXISTS steps_episode_idx   ON steps(episode_id);
+CREATE INDEX IF NOT EXISTS steps_ret_idx       ON steps(ret);
+CREATE TABLE IF NOT EXISTS model_stats (
+    member   TEXT NOT NULL,
+    scope    TEXT NOT NULL,
+    trials   INTEGER DEFAULT 0,
+    wins     INTEGER DEFAULT 0,
+    ret_sum  REAL DEFAULT 0.0,
+    PRIMARY KEY (member, scope)
+);
+CREATE TABLE IF NOT EXISTS risks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    episode_id  INTEGER REFERENCES episodes(id) ON DELETE CASCADE,
+    ts          REAL,
+    member      TEXT,
+    description TEXT,
+    severity    TEXT,
+    detail      TEXT
+);
+PRAGMA journal_mode=WAL;
+"""
+
+
+@dataclass
+class Step:
+    id: int = 0
+    episode_id: int = 0
+    t: int = 0
+    state: str = ""
+    state_fp: str = ""
+    action: str = ""
+    action_fp: str = ""
+    scope: str = ""
+    z: float | None = None
+    adv: float | None = None
+    z_prime: float | None = None
+    chosen: int | None = None
+    reward: float = 0.0
+    ret: float = 0.0
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Episode:
+    id: int = 0
+    task: str = ""
+    goal: str = ""
+    started_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    success: bool | None = None
+    score: float | None = None
+    analysis: str = ""
+    meta: dict = field(default_factory=dict)
+
+
+class Store:
+    def __init__(self, path: str | Path = ":memory:"):
+        path = str(path)
+        if path != ":memory:":
+            Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript(_SCHEMA)
+        self.db.commit()
+
+    def close(self) -> None:
+        self.db.close()
+
+    # -- episodes ---------------------------------------------------------
+    def start_episode(self, task: str, goal: str = "", meta: dict | None = None) -> int:
+        cur = self.db.execute(
+            "INSERT INTO episodes(task, goal, started_at, meta) VALUES(?,?,?,?)",
+            (task, goal, time.time(), json.dumps(meta or {}, ensure_ascii=False)),
+        )
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    def finish_episode(
+        self,
+        episode_id: int,
+        success: bool | None,
+        score: float | None = None,
+        analysis: str = "",
+    ) -> None:
+        self.db.execute(
+            "UPDATE episodes SET finished_at=?, success=?, score=?, analysis=? WHERE id=?",
+            (time.time(), None if success is None else int(success), score, analysis, episode_id),
+        )
+        self.db.commit()
+
+    def get_episode(self, episode_id: int) -> Episode | None:
+        row = self.db.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
+        if row is None:
+            return None
+        return Episode(
+            id=row["id"], task=row["task"], goal=row["goal"] or "",
+            started_at=row["started_at"] or 0.0, finished_at=row["finished_at"],
+            success=None if row["success"] is None else bool(row["success"]),
+            score=row["score"], analysis=row["analysis"] or "",
+            meta=json.loads(row["meta"] or "{}"),
+        )
+
+    def recent_analyses(self, task: str | None = None, limit: int = 3) -> list[str]:
+        if task:
+            rows = self.db.execute(
+                "SELECT analysis FROM episodes WHERE task=? AND analysis!='' "
+                "ORDER BY id DESC LIMIT ?",
+                (task, limit),
+            ).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT analysis FROM episodes WHERE analysis!='' ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [r["analysis"] for r in rows]
+
+    # -- steps ------------------------------------------------------------
+    def add_step(self, step: Step) -> int:
+        cur = self.db.execute(
+            "INSERT INTO steps(episode_id, t, state, state_fp, action, action_fp, scope,"
+            " z, adv, z_prime, chosen, reward, ret) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                step.episode_id, step.t, step.state, step.state_fp, step.action,
+                step.action_fp, step.scope, step.z, step.adv, step.z_prime, step.chosen,
+                step.reward, step.ret,
+            ),
+        )
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    def set_step_outcome(self, step_id: int, reward: float, ret: float) -> None:
+        self.db.execute("UPDATE steps SET reward=?, ret=? WHERE id=?", (reward, ret), step_id)
+        self.db.commit()
+
+    def all_steps(self) -> list[Step]:
+        return [Step(**dict(r)) for r in self.db.execute("SELECT * FROM steps ORDER BY id")]
+
+    def steps_for_episode(self, episode_id: int) -> list[Step]:
+        return [
+            Step(**dict(r))
+            for r in self.db.execute("SELECT * FROM steps WHERE episode_id=? ORDER BY t", (episode_id,))
+        ]
+
+    def count_steps(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM steps").fetchone()[0])
+
+    def max_step_id(self) -> int:
+        return int(self.db.execute("SELECT COALESCE(MAX(id), 0) FROM steps").fetchone()[0])
+
+    def count_episodes(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM episodes").fetchone()[0])
+
+    def delete_episode(self, episode_id: int) -> None:
+        self.db.execute("DELETE FROM steps WHERE episode_id=?", (episode_id,))
+        self.db.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
+        self.db.commit()
+
+    def wipe(self) -> None:
+        """Drop all learned experience (used by the --memory off control arm)."""
+        self.db.execute("DELETE FROM steps")
+        self.db.execute("DELETE FROM episodes")
+        self.db.execute("DELETE FROM model_stats")
+        self.db.execute("DELETE FROM risks")
+        self.db.commit()
+
+    # -- council: per-member reliability ----------------------------------
+    def record_member_outcome(self, member: str, scope: str, won: bool, ret: float = 0.0) -> None:
+        self.db.execute(
+            "INSERT INTO model_stats(member, scope, trials, wins, ret_sum) VALUES(?,?,1,?,?) "
+            "ON CONFLICT(member, scope) DO UPDATE SET trials=trials+1, "
+            "wins=wins+excluded.wins, ret_sum=ret_sum+excluded.ret_sum",
+            (member, scope, int(won), float(ret)),
+        )
+        self.db.commit()
+
+    def member_reliability(self, scope: str = "") -> dict[str, float]:
+        """Add-one smoothed win rate per member, globally pooled with scope preference.
+
+        A member with no history still gets weight: without smoothing the first
+        loss would silence it forever and the council could never recover.
+        """
+        rows = self.db.execute(
+            "SELECT member, SUM(trials) AS trials, SUM(wins) AS wins FROM model_stats "
+            "WHERE (? = '' OR scope = ? OR scope = '') GROUP BY member",
+            (scope, scope),
+        ).fetchall()
+        out: dict[str, float] = {}
+        for row in rows:
+            trials, wins = row["trials"] or 0, row["wins"] or 0
+            out[row["member"]] = (wins + 1) / (trials + 2)
+        return out
+
+    def add_risk(self, episode_id: int | None, member: str, description: str,
+                 severity: str = "medium", detail: str = "") -> None:
+        self.db.execute(
+            "INSERT INTO risks(episode_id, ts, member, description, severity, detail) VALUES(?,?,?,?,?,?)",
+            (episode_id, time.time(), member, description, severity, detail),
+        )
+        self.db.commit()
+
+    def risks_for(self, episode_id: int | None = None, limit: int = 50) -> list[dict]:
+        if episode_id is None:
+            rows = self.db.execute("SELECT * FROM risks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        else:
+            rows = self.db.execute(
+                "SELECT * FROM risks WHERE episode_id=? ORDER BY id DESC LIMIT ?", (episode_id, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
