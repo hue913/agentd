@@ -258,6 +258,13 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
 
     # The ops router needs the runtime's PTY hub and the API token, so it is
     # wired after the app exists rather than built from a module-level import.
+    ops.STATE["store"] = rt.store
+    ops.STATE["pty"] = rt.pty
+    ops.STATE["screen"] = rt.screen
+    ops.STATE["screen_actions"] = rt.screen_actions
+    ops.STATE["token"] = server_token()
+    app.include_router(ops.router)
+
     # The console is served from the same origin as the API on purpose: the PTY
     # is a WebSocket and every fetch is relative, so a separate origin would
     # mean CORS plus a second place for the token to live.
@@ -269,11 +276,6 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
         if ui_router is not None:
             app.include_router(ui_router)
 
-    ops.STATE["pty"] = rt.pty
-    ops.STATE["screen"] = rt.screen
-    ops.STATE["screen_actions"] = rt.screen_actions
-    ops.STATE["token"] = server_token()
-    app.include_router(ops.router)
 
     return app
 

@@ -50,10 +50,11 @@ class SamplingMock(MockProvider):
 
 def make_loop(store: Store | None = None, *, enabled: bool = True, beta: float = 1.0,
               max_steps: int = 6, council: bool = False, exploration_prob: float = 0.05,
-              step_cost: float = 0.03, noise: float = 0.22, gamma: float = 0.95):
+              step_cost: float = 0.03, noise: float = 0.22, gamma: float = 0.95,
+              track_credit: bool = False):
     store = store or Store()
     kernel = JitRLKernel(store=store, gamma=gamma, beta=beta, enabled=enabled, seed=11,
-                         exploration_prob=exploration_prob)
+                         exploration_prob=exploration_prob, track_credit=track_credit)
     bus = ToolBus()
     register_builtins(bus)
     critiques = ["restart nginx and verify with the healthcheck; never reboot the host"] * 40
@@ -103,6 +104,14 @@ def test_memory_turns_repeated_failures_into_success():
 
 
 def test_learning_needs_an_initial_success():
+    """The stall boundary, stated against the credit-off arm.
+
+    Credit accounting (track_credit=True) is deliberately NOT used here. The
+    mechanism under test is JitRL's advantage term alone: with a weak
+    deterministic model that never records a positive return, there is nothing
+    to reinforce. See
+    test_credit_accounting_changes_the_stall_dynamics for the other arm.
+    """
     """Known boundary of the mechanism, pinned so it cannot be forgotten.
 
     The kernel's exploration term applies only to actions that have never been
@@ -195,3 +204,38 @@ def test_beta_zero_equals_control_arm():
     seq_beta = [beta0.run(nginx_down()).steps[0].chosen_action for _ in range(5)]
     seq_off = [off.run(nginx_down()).steps[0].chosen_action for _ in range(5)]
     assert seq_beta and seq_beta == seq_off
+
+
+def test_credit_accounting_changes_the_stall_dynamics():
+    """Credit is a real feedback signal, and this is what it buys.
+
+    Same weak model, same seed, same task family. With credit on, a step that
+    was recalled and then agreed with gets a similarity boost, which surfaces
+    related experience that itself succeeded -- and the family that used to
+    stall now produces at least one success. That is the observable the credit
+    counters exist to provide: a per-memory answer to "is memory helping",
+    not just an aggregate score.
+    """
+    loop, store = make_loop(track_credit=True)
+    for _ in range(4):
+        loop.run(nginx_down())
+
+    outcomes = [loop.run(approve_merge_request()).success for _ in range(24)]
+    totals = store.credit_totals()
+    assert totals["recalls"] > 0, "recall must be counted"
+    assert totals["decisions"] > 0, "agreement must be judged"
+    assert any(outcomes), (
+        "with credit on, the previously-stalling family should produce a hit; "
+        f"outcomes={outcomes} totals={totals}"
+    )
+
+
+def test_credit_is_neutral_before_any_outcome_exists():
+    """A memory with no decision history must not be pushed around."""
+    from agentd.kernel.credit import credit_factor
+
+    assert credit_factor(0, 0) == 1.0
+    assert credit_factor(0, 1) < 1.0
+    assert credit_factor(1, 0) > 1.0
+    # one loss cannot erase a step that has been right many times
+    assert credit_factor(9, 1) > credit_factor(1, 1)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .credit import credit_factor, migrate
+
 import json
 import sqlite3
 import time
@@ -77,6 +79,11 @@ class Step:
     chosen: int | None = None
     reward: float = 0.0
     ret: float = 0.0
+    # Credit accounting. all_steps() does Step(**dict(row)), so these three must
+    # exist on the dataclass or every read of the table raises TypeError.
+    recalls: int = 0
+    adopted: int = 0
+    rejected: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -103,6 +110,7 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(_SCHEMA)
+        migrate(self.db)
         self.db.commit()
 
     def close(self) -> None:
@@ -248,3 +256,53 @@ class Store:
                 "SELECT * FROM risks WHERE episode_id=? ORDER BY id DESC LIMIT ?", (episode_id, limit)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # -- credit accounting ------------------------------------------------
+    def note_recall(self, step_ids: list[int]) -> None:
+        """Record that these experiences were surfaced to the kernel."""
+        ids = [int(i) for i in step_ids if i]
+        if not ids:
+            return
+        self.db.executemany("UPDATE steps SET recalls = recalls + 1 WHERE id = ?",
+                            [(i,) for i in ids])
+        self.db.commit()
+
+    def note_outcome(self, step_id: int, adopted: bool) -> None:
+        """Record whether the decision that followed agreed with this step."""
+        column = "adopted" if adopted else "rejected"
+        self.db.execute(f"UPDATE steps SET {column} = {column} + 1 WHERE id = ?", (int(step_id),))
+        self.db.commit()
+
+    def credit_report(self, limit: int = 50) -> list[dict]:
+        """Per-memory credit, most-decided first. Feeds /api/credit."""
+        rows = self.db.execute(
+            "SELECT id, episode_id, substr(state, 1, 120) AS state, action, ret, "
+            "       recalls, adopted, rejected "
+            "FROM steps WHERE (adopted + rejected) > 0 "
+            "ORDER BY (adopted + rejected) DESC, id DESC LIMIT ?",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"], "episode_id": r["episode_id"], "state": r["state"],
+                "action": r["action"], "ret": r["ret"],
+                "recalls": r["recalls"], "adopted": r["adopted"], "rejected": r["rejected"],
+                "credit": round(credit_factor(r["adopted"], r["rejected"]), 4),
+            })
+        return out
+
+    def credit_totals(self) -> dict:
+        row = self.db.execute(
+            "SELECT COUNT(*) AS steps, "
+            "       COALESCE(SUM(recalls), 0) AS recalls, "
+            "       COALESCE(SUM(adopted), 0) AS adopted, "
+            "       COALESCE(SUM(rejected), 0) AS rejected FROM steps"
+        ).fetchone()
+        decided = row["adopted"] + row["rejected"]
+        return {
+            "steps": row["steps"], "recalls": row["recalls"],
+            "adopted": row["adopted"], "rejected": row["rejected"],
+            "decisions": decided,
+            "adoption_rate": round(row["adopted"] / decided, 4) if decided else None,
+        }

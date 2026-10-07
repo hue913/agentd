@@ -11,6 +11,7 @@ import random
 from dataclasses import dataclass, field
 
 from .advantage import AdvantageResult, estimate
+from .state import normalize_action
 from .episode import EpisodeRecorder
 from .rerank import RerankResult, rerank
 from .retrieval import Neighbor, Retriever
@@ -54,6 +55,7 @@ class JitRLKernel:
         seed: int | None = None,
         enabled: bool = True,
         recall_analysis: int = 2,
+        track_credit: bool = True,
     ):
         self.store = store or Store()
         self.retriever = Retriever(self.store, ngram=ngram, top_k=top_k, min_sim=min_sim)
@@ -64,6 +66,8 @@ class JitRLKernel:
         self.rng = random.Random(seed)
         self.enabled = enabled
         self.recall_analysis = recall_analysis
+        # Off gives the A/B arm: same retrieval, no credit feedback.
+        self.track_credit = track_credit
 
     def decide(
         self,
@@ -80,10 +84,21 @@ class JitRLKernel:
             return Decision(result, [], AdvantageResult(scope=scope, notes="memory disabled"))
 
         neighbors = self.retriever.neighbors(state_text)
+        # Count the recall before deciding, so a step is credited for being
+        # surfaced even if this decision goes a different way.
+        self.store.note_recall([n.step_id for n in neighbors])
         adv = estimate(candidates, neighbors, exploration_prob=self.exploration_prob,
                        alpha=self.alpha, rng=self.rng, scope=scope)
         result = rerank(candidates, z, adv.normalized, beta=self.beta, mode=mode, reasoning=reasoning)
-        return Decision(result, neighbors, adv)
+        decision = Decision(result, neighbors, adv)
+        if self.track_credit:
+            # Agreement is judged on the normalised action, the same key the
+            # advantage estimator groups by -- otherwise punctuation differences
+            # would make every recall look rejected.
+            chosen_fp = normalize_action(result.chosen.text)
+            for n in neighbors:
+                self.store.note_outcome(n.step_id, normalize_action(n.action) == chosen_fp)
+        return decision
 
     def begin(self, task: str, goal: str = "", meta: dict | None = None) -> EpisodeRecorder:
         return EpisodeRecorder(self.store, task, goal, gamma=self.gamma, meta=meta)
@@ -98,4 +113,6 @@ class JitRLKernel:
             "enabled": self.enabled,
             "beta": self.beta,
             "gamma": self.gamma,
+            "track_credit": self.track_credit,
+            "credit": self.store.credit_totals(),
         }

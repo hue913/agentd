@@ -18,6 +18,12 @@ from pathlib import Path
 from fastapi import HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 
+# The console is a catch-all (`/{asset:path}`) so the SPA can own routing.
+# That makes it dangerous to mount before the API: it would answer any
+# unknown /api/... path with index.html and a 200. These are refused
+# explicitly so a missing route is a clean 404, never a silent HTML page.
+RESERVED_PREFIXES = ("/api/", "/events", "/healthz")
+
 ALLOWED_SUFFIXES = {".html", ".js", ".css", ".json", ".svg", ".png", ".ico", ".woff", ".woff2", ".map"}
 MAX_BYTES = 8 * 1024 * 1024
 
@@ -40,6 +46,11 @@ def make_ui_router(root: Path):
 
     @router.get("/{asset:path}")
     def asset(asset: str):
+        # The path parameter arrives WITHOUT a leading slash, so comparing it
+        # against prefixes that have one never matches -- which is exactly how
+        # /api/does-not-exist came back as index.html with a 200.
+        if ("/" + asset.lstrip("/")).startswith(RESERVED_PREFIXES):
+            raise HTTPException(404, "not a console asset")
         # Reject traversal before touching the filesystem. resolve() alone is
         # not enough once symlinks are in play, hence the is_relative_to check.
         candidate = (root / asset).resolve()

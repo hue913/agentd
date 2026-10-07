@@ -287,3 +287,17 @@ async def screen_vision():
     """Is a vision model actually attached? The agent should ask, not assume."""
     _, perceiver = _screen()
     return {"has_vision": perceiver.has_vision, "model": perceiver.model_name}
+
+
+@router.get("/api/credit")
+async def credit(limit: int = 50):
+    """Per-memory credit, plus the totals.
+
+    This is the observable that answers "is memory actually helping" with a
+    number per memory rather than only an aggregate bench score.
+    """
+    store = STATE.get("store")
+    if store is None:
+        raise HTTPException(503, "store not initialised")
+    return {"entries": await asyncio.to_thread(store.credit_report, limit),
+            "totals": await asyncio.to_thread(store.credit_totals)}

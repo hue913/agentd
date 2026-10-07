@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .credit import credit_factor
 from .state import ngrams, normalize_action, normalize_state, tokenize
 from .store import Store
 
@@ -23,6 +24,10 @@ class Neighbor:
     scope: str
     ret: float
     sim: float
+    recalls: int = 0
+    adopted: int = 0
+    rejected: int = 0
+    credit: float = 1.0
 
 
 class Retriever:
@@ -72,9 +77,16 @@ class Retriever:
                 Neighbor(
                     step_id=step.id, episode_id=step.episode_id, state=step.state,
                     action=step.action, action_fp=step.action_fp, scope=step.scope, ret=step.ret, sim=sim,
+                    recalls=step.recalls, adopted=step.adopted, rejected=step.rejected,
                 )
             )
-        scored.sort(key=lambda n: (-n.sim, -n.ret))
+        # Credit multiplies similarity; it never replaces it. A step with no
+        # outcomes yet has factor exactly 1.0 and is untouched, so this can only
+        # re-order experiences that were already similar enough to be retrieved --
+        # it can never pull an unrelated step into the top-k.
+        for n in scored:
+            n.credit = credit_factor(n.adopted, n.rejected)
+        scored.sort(key=lambda n: (-(n.sim * n.credit), -n.ret))
         return scored[: self.top_k]
 
     def action_returns(self, neighbors: list[Neighbor]) -> dict[str, list[float]]:

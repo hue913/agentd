@@ -119,6 +119,7 @@ class Runtime:
                            gamma=float(cfg.get("gamma", 0.95)), top_k=int(cfg.get("top_k", 8)),
                            ngram=int(cfg.get("ngram", 2)), min_sim=float(cfg.get("min_sim", 0.02)),
                            exploration_prob=float(cfg.get("epsilon", 0.05)),
+                           track_credit=bool(cfg.get("track_credit", True)),
                            seed=cfg.get("seed"), enabled=enabled)
 
     def _load_extensions(self) -> dict:
