@@ -14,5 +14,4 @@ data/
 *.sqlite
 *.sqlite3
 .env
-
-ui/vendor/
+.DS_Store
