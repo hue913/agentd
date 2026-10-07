@@ -1,0 +1,12 @@
+agentd
+Copyright 2026 agentd contributors
+
+This product is an independent implementation of the method described in
+"Just-In-Time Reinforcement Learning: Continual Learning in LLM Agents Without
+Gradient Updates" by Yibo Li, Zijie Lin, Ailin Deng, Xuan Zhang, Yufei He,
+Shuo Ji, Tri Cao and Bryan Hooi (National University of Singapore),
+arXiv:2601.18510. No code from that work's reference implementation is
+included; the attribution is for the method and the ideas.
+
+The council protocol descends from open-project-council
+(https://github.com/hue913/open-project-council, Apache-2.0).

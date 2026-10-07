@@ -1,0 +1,39 @@
+{
+  "db": "~/.config/agentd/memory.db",
+  "kernel": {
+    "beta": 1.0,
+    "gamma": 0.95,
+    "epsilon": 0.05,
+    "top_k": 8,
+    "ngram": 2,
+    "min_sim": 0.02,
+    "seed": 7
+  },
+  "default_provider": "local",
+  "providers": {
+    "local": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "model": "qwen3-8b",
+      "api_key_env": "AGENTD_LOCAL_KEY",
+      "tier": "cheap",
+      "temperature": 0.7
+    },
+    "gateway": {
+      "base_url": "https://api.example-gateway.com/v1",
+      "model": "deepseek-v3.2",
+      "api_key_env": "AGENTD_GATEWAY_KEY",
+      "tier": "strong"
+    }
+  },
+  "ssh_hosts": [
+    { "label": "app-01", "host": "10.0.0.5", "port": 22, "user": "ops",
+      "key_path": "~/.ssh/id_ed25519" },
+    { "label": "spark", "host": "spark.example.com", "port": 39950, "user": "xy",
+      "key_path": "~/.ssh/spark", "jump": "" }
+  ],
+  "plugins_dir": "~/.config/agentd/plugins",
+  "skills_dir": "~/.config/agentd/skills",
+  "mcp_servers": {
+    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] }
+  }
+}
