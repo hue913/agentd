@@ -112,6 +112,10 @@ class Store:
         self.db.executescript(_SCHEMA)
         migrate(self.db)
         self.db.commit()
+        # Step rows are mutable after insertion (credit counters, outcomes).
+        # Consumers that snapshot steps — the retrieval index — need to know
+        # which ids changed so they can refresh only those rows.
+        self._mutated_steps: list[int] = []
 
     def close(self) -> None:
         self.db.close()
@@ -184,6 +188,14 @@ class Store:
 
     def all_steps(self) -> list[Step]:
         return [Step(**dict(r)) for r in self.db.execute("SELECT * FROM steps ORDER BY id")]
+
+    def steps_after(self, step_id: int) -> list[Step]:
+        """Steps with id > step_id, ascending — the delta feed the retrieval
+        index consumes so a growing memory never triggers a full rebuild."""
+        return [
+            Step(**dict(r))
+            for r in self.db.execute("SELECT * FROM steps WHERE id > ? ORDER BY id", (step_id,))
+        ]
 
     def steps_for_episode(self, episode_id: int) -> list[Step]:
         return [
@@ -266,12 +278,31 @@ class Store:
         self.db.executemany("UPDATE steps SET recalls = recalls + 1 WHERE id = ?",
                             [(i,) for i in ids])
         self.db.commit()
+        self._mutated_steps.extend(ids)
 
     def note_outcome(self, step_id: int, adopted: bool) -> None:
         """Record whether the decision that followed agreed with this step."""
         column = "adopted" if adopted else "rejected"
         self.db.execute(f"UPDATE steps SET {column} = {column} + 1 WHERE id = ?", (int(step_id),))
         self.db.commit()
+        self._mutated_steps.append(int(step_id))
+
+    def steps_by_ids(self, step_ids: list[int]) -> list[Step]:
+        """Re-read specific steps — the delta refresh for index snapshots."""
+        if not step_ids:
+            return []
+        marks = ",".join("?" * len(step_ids))
+        return [Step(**dict(r)) for r in
+                self.db.execute(f"SELECT * FROM steps WHERE id IN ({marks})", step_ids)]
+
+    def mutated_steps_since(self, seq: int) -> tuple[list[int], int]:
+        """Ids of steps mutated in place since `seq`, plus the new sequence number.
+
+        This is process-local bookkeeping: it detects mutations made through
+        this Store instance, which is the instance every kernel in the process
+        shares.
+        """
+        return self._mutated_steps[seq:], len(self._mutated_steps)
 
     def credit_report(self, limit: int = 50) -> list[dict]:
         """Per-memory credit, most-decided first. Feeds /api/credit."""

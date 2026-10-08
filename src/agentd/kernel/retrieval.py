@@ -38,20 +38,39 @@ class Retriever:
         self.min_sim = min_sim
         self._rows: list[tuple] = []
         self._postings: dict[str, list[int]] = {}
+        self._row_by_step: dict[int, int] = {}
         self._built_at = -1
+        self._mutation_seq = 0
 
     def _ensure_index(self) -> None:
+        mutated, self._mutation_seq = self.store.mutated_steps_since(self._mutation_seq)
         watermark = self.store.max_step_id()
-        if watermark == self._built_at:
+        if watermark == self._built_at and not mutated:
             return
-        self._rows = []
-        self._postings = {}
-        for i, step in enumerate(self.store.all_steps()):
+        if watermark < self._built_at:
+            # the store shrank underneath us (reset/swap): start over
+            self._rows = []
+            self._postings = {}
+            self._row_by_step = {}
+            self._built_at = -1
+        # Append-only: postings reference _rows subscripts, and subscripts only
+        # grow, so new steps extend the index without touching existing rows.
+        for step in self.store.steps_after(self._built_at):
+            i = len(self._rows)
             grams = ngrams(tokenize(step.state), self.ngram)
             self._rows.append((i, step, grams))
+            self._row_by_step[step.id] = i
             for g in grams:
                 self._postings.setdefault(g, []).append(i)
         self._built_at = watermark
+        if mutated:
+            # Credit counters (and outcomes) are written AFTER a step lands in
+            # the index; re-read just those rows so ranking stays honest.
+            known = [sid for sid in set(mutated) if sid in self._row_by_step]
+            for step in self.store.steps_by_ids(known):
+                i = self._row_by_step[step.id]
+                _, _, grams = self._rows[i]
+                self._rows[i] = (i, step, grams)
 
     def neighbors(self, state_text: str) -> list[Neighbor]:
         """Most similar past states, ranked by Jaccard similarity of n-gram sets."""

@@ -171,3 +171,57 @@ def test_probability_space_matches_reference_formula():
     assert result.chosen_index == 1
     assert result.options[0].z_prime == pytest.approx(1.25)
     assert result.options[1].z_prime == pytest.approx(-0.4)
+
+
+NEW_STATE = "kubernetes pod list with a restart button and a status column"
+
+
+def test_steps_after_returns_the_delta_in_id_order():
+    store = Store()
+    seed_experience(JitRLKernel(store=store, gamma=0.5))
+    ids = [s.id for s in store.steps_after(2)]
+    assert ids == sorted(ids) and all(i > 2 for i in ids)
+    assert len(ids) == store.count_steps() - 2
+
+
+def test_retrieval_index_grows_incrementally_without_rebuilding_old_rows():
+    """Adding steps must extend the index in place: _rows keeps its identity,
+    old postings entries keep their subscripts, and the new step is retrievable."""
+    store = Store()
+    seed_experience(JitRLKernel(store=store, gamma=0.5))
+    r = Retriever(store, ngram=2, top_k=8)
+    r.neighbors(STATE)  # force the initial build
+    rows_before = r._rows
+    old_row_count = len(r._rows)
+    old_postings = {g: list(v) for g, v in r._postings.items()}
+
+    rec = JitRLKernel(store=store, gamma=0.5).begin("buy item", "buy item")
+    rec.record(NEW_STATE, "click [restart]", z=0.5, reward=1.0, scope="")
+    rec.finish(success=True, score=1.0, analysis="restart worked")
+    new_step_id = store.max_step_id()
+
+    near = r.neighbors(NEW_STATE)
+    assert any(n.step_id == new_step_id for n in near), "new step must be recalled"
+    # identity, not contents: a rebuild would re-create the list object
+    assert r._rows is rows_before, "_ensure_index must append, not rebuild"
+    assert len(r._rows) == old_row_count + 1
+    for g, rows in old_postings.items():
+        assert r._postings.get(g, [])[:len(rows)] == rows, \
+            "existing postings must keep their subscripts"
+    # and the old neighbours are still found with the same similarities
+    again = r.neighbors(STATE)
+    assert again and again[0].sim > 0.5
+
+
+def test_index_refreshes_rows_mutated_in_place():
+    """Credit counters change AFTER a step is indexed; the snapshot must follow."""
+    store = Store()
+    seed_experience(JitRLKernel(store=store, gamma=0.5))
+    r = Retriever(store, ngram=2, top_k=8)
+    r.neighbors(STATE)
+    target_id = r._rows[0][1].id
+    store.note_recall([target_id])
+    store.note_outcome(target_id, adopted=True)
+    r.neighbors(STATE)  # triggers the refresh
+    assert r._rows[0][1].recalls == 1
+    assert r._rows[0][1].adopted == 1
