@@ -327,7 +327,11 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
         # load. Fall back to the placeholder only when the console is absent.
         ui_index = Path(os.environ.get("AGENTD_UI_DIR", "/var/lib/agentd/ui")) / "index.html"
         if ui_index.is_file():
-            return HTMLResponse(ui_index.read_text(encoding="utf-8"))
+            # This handler shadows the console router's "/" (see above), so it
+            # must carry the same security headers the console sends.
+            from .ui import _security_headers
+            return HTMLResponse(ui_index.read_text(encoding="utf-8"),
+                                headers=_security_headers())
         return _PLACEHOLDER_PAGE
 
     # The ops router needs the runtime's PTY hub and the API token, so it is

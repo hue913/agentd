@@ -116,3 +116,25 @@ def test_traversal_is_refused(served):
     for path in ("/../etc/passwd", "/%2e%2e/%2e%2e/etc/passwd"):
         code, _, body = _get(served + path)
         assert "root:x:0:0" not in body, path
+
+
+def test_console_responses_carry_csp_with_frame_ancestors(served):
+    """Header CSP must mirror the index.html meta CSP plus frame-ancestors.
+
+    frame-ancestors cannot be expressed via <meta>, so the header is the only
+    defense against clickjacking/iframe embedding of this admin console.
+    """
+    with urllib.request.urlopen(served + "/", timeout=10) as r:
+        csp = r.headers.get("Content-Security-Policy", "")
+    assert csp, "GET / must send a Content-Security-Policy header"
+    assert "frame-ancestors 'none'" in csp
+    # Keep the header in sync with the meta directives the console relies on.
+    assert "default-src 'self'" in csp
+    assert "connect-src 'self'" in csp  # covers the same-host PTY WebSocket
+
+
+def test_asset_responses_have_nosniff(served):
+    """MIME confusion on served assets must be impossible (nosniff)."""
+    for path in ("/app.js", "/"):
+        with urllib.request.urlopen(served + path, timeout=10) as r:
+            assert r.headers.get("X-Content-Type-Options") == "nosniff", path

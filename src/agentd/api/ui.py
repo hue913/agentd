@@ -21,6 +21,30 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 ALLOWED_SUFFIXES = {".html", ".js", ".css", ".json", ".svg", ".png", ".ico", ".woff", ".woff2", ".map"}
 MAX_BYTES = 8 * 1024 * 1024
 
+# SYNC NOTE: this must stay byte-identical to the <meta http-equiv=...> CSP in
+# ui/index.html (~line 13) -- the meta covers navigation of the document itself,
+# the header covers every response, and a drift between the two silently
+# weakens whichever side is stricter. The header version additionally carries
+# `frame-ancestors 'none'` because that directive is only expressible via HTTP
+# header, not via <meta>: the console holds an admin token and is reached over
+# an SSH tunnel to 127.0.0.1, so no legitimate site (including other localhost
+# services' pages) may embed it in an iframe / clickjack it. Do not add HSTS
+# here -- the service is loopback + tunnel, no HTTPS semantics exist.
+CONSOLE_CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; "
+               "img-src 'self'; connect-src 'self'; form-action 'self'; "
+               "base-uri 'self'; frame-ancestors 'none'")
+
+
+def _security_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Common security headers for every HTML/asset response."""
+    headers = {
+        "Content-Security-Policy": CONSOLE_CSP,
+        "X-Content-Type-Options": "nosniff",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
 
 def _weak_etag(st: object) -> str:
     """Weak validator from (size, mtime): same file content changes -> new tag.
@@ -63,7 +87,8 @@ def make_ui_router(root: Path):
         page = root / "index.html"
         if not page.is_file():
             raise HTTPException(404, "console not installed")
-        return HTMLResponse(page.read_text(encoding="utf-8"))
+        return HTMLResponse(page.read_text(encoding="utf-8"),
+                            headers=_security_headers())
 
     @router.get("/{asset:path}")
     def asset(asset: str, request: Request):
@@ -85,7 +110,8 @@ def make_ui_router(root: Path):
             # Single-page app: let the shell handle unknown routes.
             page = root / "index.html"
             if page.is_file():
-                return HTMLResponse(page.read_text(encoding="utf-8"))
+                return HTMLResponse(page.read_text(encoding="utf-8"),
+                                    headers=_security_headers())
             raise HTTPException(404, "not found")
         st = candidate.stat()
         if st.st_size > MAX_BYTES:
@@ -100,7 +126,8 @@ def make_ui_router(root: Path):
                             headers={"ETag": etag, "Cache-Control": "no-cache"})
         ctype = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
         return FileResponse(candidate, media_type=ctype,
-                            headers={"Cache-Control": "no-cache", "ETag": etag})
+                            headers=_security_headers(
+                                {"Cache-Control": "no-cache", "ETag": etag}))
 
     return router
 
