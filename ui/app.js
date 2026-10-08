@@ -35,7 +35,10 @@
     // Every call gets a hard deadline; a hung tunnel must surface as an error,
     // not as a spinner that never resolves.
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
+    // Per-call deadline override: exec-many parks server-side until an
+    // approval resolves, far beyond the default 15s.
+    const timeoutMs = opts.timeoutMs || API_TIMEOUT_MS;
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     let res;
     try {
       res = await fetch(path, Object.assign({}, opts, { headers, signal: ctrl.signal }));
@@ -224,11 +227,21 @@
     document.querySelectorAll(".view").forEach((v) =>
       v.classList.toggle("on", v.id === "view-" + view));
 
-    if (view === "ops") { refreshOps(); loadLogs(); loadCredit(); }
+    if (view === "ops") { refreshOps(); loadLogs(); loadCredit(); loadAudit(); }
     if (view === "screen") { checkVision(); if (state.auto === null) grabFrame(); }
     if (view === "models") loadSeats();
     if (view === "council") loadSeatPicker();
+    if (view === "fleet") {
+      loadFleet();
+      if (fleetAutoOn) startFleetAuto();
+      // A batch exec waiting on approval resumes its resend loop here.
+      if (execPending) scheduleExecRetry();
+    }
+    if (view === "hosts") loadHosts();
     if (view === "terminal" && state.term) setTimeout(() => { try { state.fit.fit(); } catch (_) {} }, 40);
+    // Leaving the fleet view stops both of its loops; the waiting exec keeps
+    // its pending body so coming back can resume instead of resubmitting.
+    if (view !== "fleet") { stopFleetAuto(); stopExecRetry(); }
   }
 
   /* ───────────────────────── state ───────────────────────── */
@@ -240,14 +253,10 @@
       const nHosts = (st.hosts || []).length;
       conn(true, `${nModels} 个模型 · ${nHosts} 台主机`);
 
-      const hostSel = $("pty-host");
-      if (hostSel && !hostSel.options.length) {
-        (st.hosts || []).forEach((h) => hostSel.add(new Option(h, h)));
-        if (!hostSel.options.length) {
-          hostSel.add(new Option("（没有配置主机）", ""));
-          hostSel.disabled = true;
-        }
-      }
+      // runtime.state() hosts may be bare labels (older servers) or objects
+      // with policy/tags; normalize both so every downstream select is built
+      // the same way, and rebuild on every load so CRUD stays reflected.
+      refreshHostSelects(normHosts(st));
       const logSel = $("log-unit");
       if (logSel && !logSel.options.length) {
         (st.services || []).forEach((s) => logSel.add(new Option(s.unit, s.unit)));
@@ -864,6 +873,569 @@
     }
   }
 
+  /* ───────────────────────── fleet · hosts · exec-many ─────────────────────────
+   * The fleet view is the operator's map of every machine agentd can reach;
+   * the hosts view is where that map is edited. Both read the same frozen
+   * /api/hosts contract, so a short-TTL cache is shared between them and the
+   * exec panel's checkbox list rides along with whichever view fetched last.
+   */
+
+  const POLICY_CLASS = { standard: "pol-standard", strict: "pol-strict", permissive: "pol-permissive" };
+
+  function policyBadge(policy) {
+    const p = policy || "standard";
+    return `<span class="tag ${POLICY_CLASS[p] || "pol-standard"}">${esc(p)}</span>`;
+  }
+
+  /* runtime.state() hosts elements: bare label strings (legacy) or objects. */
+  function normHosts(st) {
+    return (st.hosts || []).map((h) => (typeof h === "string" ? { label: h } : h));
+  }
+
+  /* Rebuild every host-bearing <select> from one list. Options are created
+   * via new Option (textContent), never innerHTML, so labels need no escaping
+   * on this path. The current selection survives a rebuild when it still
+   * exists; strict hosts get the tinted option class. */
+  function refreshHostSelects(hosts) {
+    const sel = $("pty-host");
+    if (sel) {
+      const cur = sel.value;
+      sel.innerHTML = "";
+      hosts.forEach((h) => {
+        const o = new Option(h.label, h.label);
+        if ((h.policy || "standard") === "strict") o.className = "opt-strict";
+        sel.add(o);
+      });
+      if (!hosts.length) {
+        sel.add(new Option("（没有配置主机）", ""));
+        sel.disabled = true;
+      } else {
+        sel.disabled = false;
+        if (cur && hosts.some((h) => h.label === cur)) sel.value = cur;
+      }
+    }
+    const audit = $("audit-host");
+    if (audit) {
+      const cur = audit.value;
+      audit.innerHTML = "";
+      audit.add(new Option("全部主机", ""));
+      hosts.forEach((h) => {
+        const o = new Option(h.label, h.label);
+        if ((h.policy || "standard") === "strict") o.className = "opt-strict";
+        audit.add(o);
+      });
+      if (cur && (cur === "" || hosts.some((h) => h.label === cur))) audit.value = cur;
+    }
+  }
+
+  /* ── shared /api/hosts cache ── */
+
+  let hostsCache = null;
+  let hostsCacheAt = 0;
+  const HOSTS_TTL_MS = 15000;
+
+  async function fetchHosts(force = false) {
+    if (!force && hostsCache !== null && Date.now() - hostsCacheAt < HOSTS_TTL_MS) return hostsCache;
+    const data = await api("api/hosts");
+    hostsCache = data.hosts || [];
+    hostsCacheAt = Date.now();
+    refreshHostSelects(hostsCache);
+    return hostsCache;
+  }
+
+  function invalidateHosts() { hostsCache = null; hostsCacheAt = 0; }
+
+  function hostStatus(h) {
+    // online is true / false / unknown(absent); the lamp shows exactly that.
+    if (h.online === true) return "on";
+    if (h.online === false) return "off";
+    return "unk";
+  }
+
+  function fmtKb(kb) {
+    const n = Number(kb);
+    if (!isFinite(n) || n <= 0) return "—";
+    return n >= 2 ** 20 ? (n / 2 ** 20).toFixed(1) + " GB" : (n / 2 ** 10).toFixed(0) + " MB";
+  }
+
+  function fmtTs(ts) {
+    const n = Number(ts);
+    if (!isFinite(n) || n <= 0) return "—";
+    const d = new Date(n < 1e12 ? n * 1000 : n);
+    return isNaN(d.getTime()) ? "—" : d.toLocaleTimeString();
+  }
+
+  /* ── fleet overview ── */
+
+  let fleetTimer = null;
+  let fleetAutoOn = true;
+
+  function startFleetAuto() {
+    stopFleetAuto();
+    fleetTimer = setInterval(() => {
+      // Paused while the page is hidden and while another view is on; the
+      // toggle owns the rest.
+      if (document.visibilityState !== "visible") return;
+      if (!$("view-fleet").classList.contains("on")) return;
+      loadFleet();
+    }, 30000);
+  }
+
+  function stopFleetAuto() {
+    if (fleetTimer !== null) { clearInterval(fleetTimer); fleetTimer = null; }
+  }
+
+  async function loadFleet() {
+    const grid = $("fleet-grid");
+    if (!grid) return;
+    try {
+      const hosts = await fetchHosts();
+      $("fleet-empty").hidden = hosts.length > 0;
+      const on = hosts.filter((h) => h.online === true).length;
+      $("fleet-summary").textContent =
+        hosts.length ? `${hosts.length} 台 · 在线 ${on}` : "没有主机";
+      grid.innerHTML = hosts.map((h) => {
+        const st = hostStatus(h);
+        const stTxt = st === "on" ? "在线" : st === "off"
+          ? `离线${h.unreachable_reason ? " · " + h.unreachable_reason : ""}` : "状态未知";
+        const m = h.metrics || {};
+        const memPct = (Number(m.mem_total) > 0 && Number(m.mem_used) >= 0)
+          ? Math.round((m.mem_used / m.mem_total) * 100) + "%" : "—";
+        // disk_pct is an int sentinel: -1 means unknown (backend contract).
+        const diskTxt = (m.disk_pct == null || Number(m.disk_pct) < 0)
+          ? "—" : `${m.disk_pct}%`;
+        const tags = (h.tags || []).map((t) => `<span class="tag tagchip">${esc(t)}</span>`).join(" ");
+        const la = h.last_action || {};
+        const laRc = la.rc != null
+          ? `<span class="${Number(la.rc) === 0 ? "rc-ok" : "rc-bad"}">rc ${esc(la.rc)}</span>` : "";
+        const laLine = (la.command || la.ts || la.rc != null)
+          ? `${esc(fmtTs(la.ts))} · ${esc(la.command || "—")} ${laRc}` : "还没有执行记录";
+        return `<div class="speech fleet" data-host="${esc(h.label)}" title="点击打开 ${esc(h.label)} 的终端">
+          <h4><span class="lamp ${st}"></span>${esc(h.label)} ${policyBadge(h.policy)}</h4>
+          <p class="muted sm">${esc(stTxt)}</p>
+          <div class="fleet-metrics">
+            <span>负载 <b>${esc(m.load1 ?? "—")}</b></span>
+            <span>进程 <b>${esc(m.procs ?? "—")}</b></span>
+            <span>内存 <b>${esc(fmtKb(m.mem_used))} / ${esc(fmtKb(m.mem_total))}</b>（${esc(memPct)}）</span>
+            <span>磁盘 <b>${esc(diskTxt)}</b></span>
+          </div>
+          <div class="host-tags" style="margin-top:6px">${tags || ""}</div>
+          <div class="fleet-last">最近动作：${laLine}</div>
+        </div>`;
+      }).join("");
+      grid.querySelectorAll(".fleet").forEach((el) => {
+        el.onclick = () => gotoTerminalHost(el.dataset.host || "");
+      });
+    } catch (e) {
+      grid.innerHTML = `<div class="muted" style="grid-column:1/-1">读取失败：${esc(e.message)}</div>`;
+      $("fleet-summary").textContent = "读取失败";
+    }
+  }
+
+  /* Fleet card → terminal: make sure the dropdown knows the host, select it,
+   * and switch views. */
+  function gotoTerminalHost(label) {
+    if (!label) return;
+    const sel = $("pty-host");
+    if (sel) {
+      let opt = [...sel.options].find((o) => o.value === label);
+      if (!opt) { opt = new Option(label, label); sel.add(opt); }
+      sel.disabled = false;
+      sel.value = label;
+    }
+    goto("terminal");
+    toast(`已切换到 ${label} 的终端`);
+  }
+
+  async function probeAllHosts() {
+    const btn = $("btn-probe-all");
+    btn.disabled = true;
+    btn.textContent = "探活中…";
+    try {
+      const hosts = await fetchHosts(true);
+      if (!hosts.length) { toast("没有主机可探活"); return; }
+      const rs = await Promise.allSettled(hosts.map((h) =>
+        api(`api/hosts/${encodeURIComponent(h.label)}/probe`, { method: "POST" })));
+      const ok = rs.filter((r) => r.status === "fulfilled").length;
+      toast(`全部探活完成：${ok}/${hosts.length} 成功`, ok === hosts.length ? "good" : "");
+      invalidateHosts();
+      await loadFleet();
+    } catch (e) {
+      toast("全部探活失败：" + e.message, "bad");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "全部探活";
+    }
+  }
+
+  /* ── batch execution (exec-many) ── */
+
+  let execPending = null;      // { body, gen } while waiting on approval
+  let execGen = 0;             // bump on each submit; stale loops exit
+  let execRetryTimer = null;
+
+  function renderExecHosts(hosts) {
+    const box = $("exec-hosts");
+    if (!box) return;
+    const prev = new Set([...box.querySelectorAll("input:checked")].map((i) => i.value));
+    box.innerHTML = hosts.length
+      ? hosts.map((h) =>
+          `<label class="chk sm"><input type="checkbox" value="${esc(h.label)}"` +
+          `${prev.has(h.label) ? " checked" : ""}> ${esc(h.label)}</label>`).join("")
+      : '<span class="muted sm">没有主机 —— 去「主机」页添加</span>';
+    const sel = $("exec-tag-sel");
+    if (!sel) return;
+    const tags = [...new Set(hosts.flatMap((h) => h.tags || []))];
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">按 tag 圈选…</option>' +
+      tags.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
+    if (tags.includes(cur)) sel.value = cur;
+  }
+
+  /* Picking a tag selects every host carrying it; picking it again when they
+   * are all selected clears them, so it works as a toggle. */
+  function onExecTagPick() {
+    const tag = $("exec-tag-sel").value;
+    if (!tag) return;
+    const boxes = [...document.querySelectorAll("#exec-hosts input")].filter((i) => {
+      const h = hostsCache && hostsCache.find((x) => x.label === i.value);
+      return h && (h.tags || []).includes(tag);
+    });
+    if (!boxes.length) { toast(`没有主机带 tag「${tag}」`); return; }
+    const allOn = boxes.every((i) => i.checked);
+    boxes.forEach((i) => { i.checked = !allOn; });
+  }
+
+  function setExecStatus(kind, text) {
+    const box = $("exec-status");
+    if (!box) return;
+    if (!kind) { box.hidden = true; box.innerHTML = ""; return; }
+    box.hidden = false;
+    box.className = "exec-status" + (kind === "error" ? " error" : "");
+    box.innerHTML = `<span style="flex:1">${esc(text)}</span>` +
+      (kind === "waiting" ? '<button class="ghost sm" id="btn-exec-resend">立即重发</button>' : "");
+    const rb = $("btn-exec-resend");
+    if (rb) rb.onclick = () => { stopExecRetry(); sendExecMany(); };
+  }
+
+  function scheduleExecRetry() {
+    stopExecRetry();
+    // While blocked on approval the same request is resent on a slow loop;
+    // the tick dies quietly if the view was left or the run superseded.
+    execRetryTimer = setTimeout(() => {
+      if (execPending && $("view-fleet").classList.contains("on")) sendExecMany();
+    }, 6000);
+  }
+
+  function stopExecRetry() {
+    if (execRetryTimer !== null) { clearTimeout(execRetryTimer); execRetryTimer = null; }
+  }
+
+  async function runExecMany() {
+    const labels = [...document.querySelectorAll("#exec-hosts input:checked")].map((i) => i.value);
+    const command = $("exec-cmd").value;
+    if (!labels.length) return toast("先勾选至少一台主机", "bad");
+    if (!command.trim()) return toast("先输入要执行的命令", "bad");
+    const mode = $("exec-mode").value;
+    const body = { labels, command, mode };
+    if (mode === "rolling") {
+      const raw = $("exec-order").value.trim();
+      if (raw) {
+        const order = raw.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+        const bad = order.filter((l) => !labels.includes(l));
+        if (bad.length) return toast(`滚动顺序里有未勾选的主机：${bad.join("、")}`, "bad");
+        body.order = order;
+      }
+    }
+    const gen = ++execGen;
+    execPending = { body, gen };
+    execRetryCount = 0;
+    $("exec-results").innerHTML = "";
+    $("exec-banner").innerHTML = "";
+    // The POST parks server-side if the safety gate wants a human: this wait
+    // status covers both the fast path and the approval path.
+    setExecStatus("waiting", "执行中…（若安全门要求审批，会在此等待；批准后自动返回结果）");
+    await sendExecMany();
+  }
+
+  /* Transport-failure retry budget for a parked exec-many request. */
+  let execRetryCount = 0;
+  const EXEC_RETRIES_MAX = 10;
+  /* The exec-many POST parks server-side until the approval resolves
+   * (default AGENTD_APPROVAL_TIMEOUT 300s + join grace), so the client
+   * deadline must sit comfortably beyond that. */
+  const EXEC_TIMEOUT_MS = 480000;
+
+  async function sendExecMany() {
+    if (!execPending) return;
+    const { body, gen } = execPending;
+    if (gen !== execGen) return;
+    try {
+      // The command travels as an input value only: it is never written into
+      // the DOM as markup, so no round-trip injection is possible.
+      const r = await api("api/hosts/exec-many", {
+        method: "POST", body: JSON.stringify(body), timeoutMs: EXEC_TIMEOUT_MS,
+      });
+      if (gen !== execGen) return;
+      execRetryCount = 0;
+      if (r && r.blocked) {
+        // A blocked 202 now only means "denied" or "identical batch in flight
+        // past the join window" — the normal parked request answers with real
+        // results itself. Auto-resending either case would open a fresh
+        // approval cycle (a deny-loop), so surface the reason and let the
+        // operator decide via the 重发 button.
+        execPending = null;
+        stopExecRetry();
+        toast("批量执行未执行：" + (r.reason || "需要审批"), "bad");
+        setExecStatus("waiting", `未执行：${r.reason || "需要审批"}。确认安全后点「立即重发」重新提交。`);
+        return;
+      }
+      execPending = null;
+      stopExecRetry();
+      setExecStatus(null, "");
+      renderExecResults(r || {});
+    } catch (e) {
+      if (gen !== execGen) return;
+      // The request parks until approval resolves; a client timeout or a
+      // dropped tunnel during that wait is not a verdict. Resending joins the
+      // in-flight batch (server-side dedupe) instead of stacking approvals.
+      if (execPending && execRetryCount < EXEC_RETRIES_MAX &&
+          /请求超时|网络错误/.test(e.message)) {
+        execRetryCount += 1;
+        setExecStatus("waiting", `等待审批/执行完成（第 ${execRetryCount}/${EXEC_RETRIES_MAX} 次自动重连）…`);
+        scheduleExecRetry();
+        return;
+      }
+      execPending = null;
+      stopExecRetry();
+      setExecStatus("error", "执行失败：" + e.message);
+      toast("批量执行失败：" + e.message, "bad");
+    }
+  }
+
+  function renderExecResults(r) {
+    const box = $("exec-results");
+    const results = r.results || [];
+    if (!results.length) {
+      box.innerHTML = '<div class="muted sm">没有返回任何结果</div>';
+      return;
+    }
+
+    // Rolling truncation banner: say where the run stopped, by name.
+    if (r.stopped_at) {
+      const last = results[results.length - 1];
+      $("exec-banner").innerHTML =
+        `<div class="exec-banner">滚动执行被中止于 ${esc(r.stopped_at)}` +
+        `${last ? ` · 停在 <b>${esc(last.label)}</b>` : ""}，之后的主机未执行。</div>`;
+    }
+
+    // Diff highlight: the first successful host is the reference; every other
+    // host whose stdout lines differ from it gets a warning border.
+    const outs = results.map((x) => String(x.stdout_tail || "").replace(/\r/g, "").split("\n"));
+    let refIdx = results.findIndex((x) => x.ok);
+    if (refIdx < 0) refIdx = 0;
+    const diffed = results.map((x, i) =>
+      !!x.ok && i !== refIdx && JSON.stringify(outs[i]) !== JSON.stringify(outs[refIdx]));
+
+    box.innerHTML = results.map((x, i) => {
+      const rcTxt = x.rc != null ? `rc ${esc(x.rc)}` : "无返回码";
+      const out = (x.stdout_tail || "") +
+        (x.stderr_tail ? (x.stdout_tail ? "\n" : "") + "[stderr] " + x.stderr_tail : "");
+      return `<div class="exec-card${diffed[i] ? " diff" : ""}">
+        <div class="exec-h"><b>${esc(x.label)}</b>` +
+        `<span class="tag ${x.ok ? "ok" : "warn"}">${rcTxt}</span>` +
+        (diffed[i] ? '<span class="tag warn">输出有差异</span>' : "") +
+        `</div>` +
+        (x.error ? `<div class="exec-err">${esc(x.error)}</div>` : "") +
+        `<pre>${esc(out) || "（无输出）"}</pre>` +
+        `</div>`;
+    }).join("");
+  }
+
+  /* ── host management ── */
+
+  let hostFormEdit = "";   // label being edited; "" = creating a new host
+  const probeReports = {}; // label → last probe report (rendered in its card)
+
+  async function loadHosts() {
+    const box = $("host-list");
+    if (!box) return;
+    try {
+      const hosts = await fetchHosts();
+      if (!hosts.length) {
+        box.innerHTML =
+          `<div class="empty" style="grid-column:1/-1">` +
+          `<p><b>还没有配置任何主机。</b></p>` +
+          `<p class="muted">在下面的表单里填第一台：标签名 + 主机地址就够连上；` +
+          `密钥、密码环境变量、跳板机都可选。self 是 agentd 所在的本机，不可删除。</p></div>`;
+        return;
+      }
+      box.innerHTML = hosts.map((h) => {
+        const st = hostStatus(h);
+        const tags = (h.tags || []).map((t) => `<span class="tag tagchip">${esc(t)}</span>`).join(" ");
+        const jump = h.jump ? `<div>跳板 <code>${esc(h.jump)}</code></div>` : "";
+        const key = h.key_path ? `<div class="ellip">密钥 ${esc(h.key_path)}</div>` : "";
+        const pwenv = h.password_env ? `<div>密码变量 <code>${esc(h.password_env)}</code></div>` : "";
+        const rep = probeReports[h.label];
+        const repBlock = rep
+          ? `<details class="probe"><summary>探活报告（${esc(fmtTs(rep.ts || rep.probed_at || Date.now() / 1000))}）</summary>` +
+            `<pre>${esc(String(probeSummary(rep)).slice(0, 1200) || "（空报告）")}</pre></details>`
+          : "";
+        return `<div class="speech host" data-host="${esc(h.label)}">
+          <h4><span class="lamp ${st}"></span>${esc(h.label)} ${policyBadge(h.policy)}</h4>
+          <p class="seat-line">${esc(h.user || "root")}@${esc(h.host)}:${esc(h.port ?? 22)}</p>
+          <div class="host-tags">${tags || ""}</div>
+          <div class="meta">
+            ${jump}${key}${pwenv}
+            ${repBlock}
+            <div class="seat-btns">
+              <button class="ghost sm" data-act="probe">探活</button>
+              <button class="ghost sm" data-act="edit">编辑</button>
+              <button class="ghost sm" data-act="del">删除</button>
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+      box.querySelectorAll(".host").forEach((el) => {
+        const label = el.dataset.host || "";
+        el.querySelector('[data-act="probe"]').onclick = () => probeHost(label);
+        el.querySelector('[data-act="edit"]').onclick = () => fillHostForm(label);
+        el.querySelector('[data-act="del"]').onclick = () => deleteHost(label);
+      });
+    } catch (e) {
+      box.innerHTML = `<div class="muted" style="grid-column:1/-1">读取失败：${esc(e.message)}</div>`;
+    }
+  }
+
+  /* Probe reports may be structured or plain text depending on backend
+   * version; flatten either into something readable. */
+  function probeSummary(r) {
+    if (r == null) return "";
+    if (typeof r === "string") return r;
+    if (typeof r.report === "string") return r.report;
+    if (r.report && typeof r.report === "object") return JSON.stringify(r.report, null, 2);
+    if (r.text) return String(r.text);
+    return JSON.stringify(r, null, 2);
+  }
+
+  async function probeHost(label) {
+    toast(`正在探活 ${label}…`);
+    try {
+      const r = await api(`api/hosts/${encodeURIComponent(label)}/probe`, { method: "POST" });
+      probeReports[label] = r && typeof r === "object" ? r : { report: r };
+      toast(`${label} 探活完成`, "good");
+      await loadHosts();
+    } catch (e) {
+      toast(`探活失败：${e.message}`, "bad");
+    }
+  }
+
+  function fillHostForm(label) {
+    const h = (hostsCache || []).find((x) => x.label === label);
+    if (!h) return;
+    hostFormEdit = label;
+    $("host-label").value = h.label || "";
+    $("host-addr").value = h.host || "";
+    $("host-port").value = h.port ?? 22;
+    $("host-user").value = h.user || "";
+    $("host-keypath").value = h.key_path || "";
+    $("host-passenv").value = h.password_env || "";
+    $("host-jump").value = h.jump || "";
+    $("host-policy").value = h.policy || "standard";
+    $("host-tags").value = (h.tags || []).join(", ");
+    $("host-form-mode").textContent = `正在编辑 ${label}`;
+    $("btn-host-save").textContent = "更新主机";
+    $("host-addr").focus();
+    toast(`已载入 ${label}，改完点「更新主机」`);
+  }
+
+  function clearHostForm() {
+    hostFormEdit = "";
+    ["host-label", "host-addr", "host-user", "host-keypath", "host-passenv",
+     "host-jump", "host-tags"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+    $("host-port").value = 22;
+    $("host-policy").value = "standard";
+    $("host-form-mode").textContent = "新增（同名会更新）";
+    $("btn-host-save").textContent = "保存主机";
+  }
+
+  async function saveHost() {
+    const label = $("host-label").value.trim();
+    const host = $("host-addr").value.trim();
+    if (!label || !host) return toast("标签名和主机地址必填", "bad");
+    const port = parseInt($("host-port").value, 10);
+    const body = {
+      label, host,
+      port: isFinite(port) && port > 0 ? port : undefined,
+      user: $("host-user").value.trim() || undefined,
+      key_path: $("host-keypath").value.trim() || undefined,
+      password_env: $("host-passenv").value.trim() || undefined,
+      jump: $("host-jump").value.trim() || undefined,
+      policy: $("host-policy").value || "standard",
+      // Tags arrive as a comma-separated input; the contract carries them as a
+      // list, so they are split client-side (empty items dropped).
+      tags: $("host-tags").value.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+    };
+    const editing = hostFormEdit;
+    const btn = $("btn-host-save");
+    btn.disabled = true;
+    try {
+      const r = editing
+        ? await api(`api/hosts/${encodeURIComponent(editing)}`, { method: "PATCH", body: JSON.stringify(body) })
+        : await api("api/hosts", { method: "POST", body: JSON.stringify(body) });
+      toast(`${editing ? "已更新" : "已新增"}主机 ${r.host && r.host.label ? r.host.label : label}`, "good");
+      clearHostForm();
+      invalidateHosts();
+      await loadHosts();
+    } catch (e) {
+      toast("保存失败：" + e.message, "bad");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function deleteHost(label) {
+    if (!label) return;
+    // Guard client-side as well: self is the machine agentd runs on.
+    if (label === "self") return toast("self 是 agentd 所在的本机，不可删除", "bad");
+    if (!confirm(`删除主机 ${label}？配置将同步移除，不可撤销。`)) return;
+    try {
+      await api(`api/hosts/${encodeURIComponent(label)}`, { method: "DELETE" });
+      toast(`已删除 ${label}`);
+      delete probeReports[label];
+      invalidateHosts();
+      await loadHosts();
+    } catch (e) {
+      toast("删除失败：" + e.message, "bad");
+    }
+  }
+
+  /* ── audit trail (ops view) ── */
+
+  async function loadAudit() {
+    const sel = $("audit-host");
+    const pre = $("audit-entries");
+    if (!sel || !pre) return;
+    const host = sel.value;
+    try {
+      const q = host ? `&host=${encodeURIComponent(host)}` : "";
+      const r = await api(`api/audit?limit=120${q}`);
+      const entries = r.entries || [];
+      pre.textContent = entries.length
+        ? entries.map((e) => {
+            const ts = e.ts ? fmtTs(e.ts) : "--:--:--";
+            const lv = e.level === "block" ? "[block]" : "[allow]";
+            const rc = e.rc != null ? ` rc=${e.rc}` : "";
+            const err = e.error ? ` err=${e.error}` : "";
+            const app = e.approved_by ? ` (by ${e.approved_by})` : "";
+            return `${ts} ${lv} ${e.host || "-"} ${e.command || e.action || ""}${rc}${app}${err}`;
+          }).join("\n")
+        : "（还没有审计记录）";
+    } catch (e) {
+      pre.textContent = "加载失败：" + e.message;
+    }
+  }
+
   /* ───────────────────────── approvals ───────────────────────── */
 
   /* Throttle for the "审批列表不可达" toast: the 4s poll would otherwise
@@ -893,7 +1465,8 @@
         el.className = "appr " + (p.level === "block" ? "block" : "");
         el.innerHTML =
           `<div class="why">${esc(why)}</div>` +
-          `<div class="cmd">${p.host ? esc(`[${p.host}] `) : ""}${esc(what)}</div>` +
+          `<div class="cmd">${p.policy ? policyBadge(p.policy) + " " : ""}` +
+          `${p.host ? esc(`[${p.host}] `) : ""}${esc(what)}</div>` +
           `<div class="acts"><button class="approve">允许</button><button class="deny">拒绝</button></div>`;
         const [ok, no] = el.querySelectorAll("button");
         ok.onclick = () => decide(p.token, true, el);
@@ -947,6 +1520,33 @@
     $("btn-seat-reload").onclick = () => { invalidateSeats(); loadSeats(); };
     $("btn-seat-manage").onclick = () => goto("models");
     $("log-unit").onchange = loadLogs;
+    // ── fleet / hosts / exec-many ──
+    $("btn-fleet-reload").onclick = () => { invalidateHosts(); loadFleet(); };
+    $("btn-fleet-auto").onclick = () => {
+      fleetAutoOn = !fleetAutoOn;
+      const b = $("btn-fleet-auto");
+      b.textContent = fleetAutoOn ? "自动刷新·开" : "自动刷新·关";
+      b.classList.toggle("off", !fleetAutoOn);
+      if (fleetAutoOn) { startFleetAuto(); loadFleet(); }
+      else stopFleetAuto();
+    };
+    $("btn-probe-all").onclick = probeAllHosts;
+    $("btn-exec-run").onclick = runExecMany;
+    $("exec-mode").onchange = () => {
+      const rolling = $("exec-mode").value === "rolling";
+      $("exec-order-row").hidden = !rolling;
+      if (rolling && !$("exec-order").value.trim()) {
+        // Prefill with the current selection so the order is editable in place.
+        const labels = [...document.querySelectorAll("#exec-hosts input:checked")].map((i) => i.value);
+        $("exec-order").value = labels.join(",");
+      }
+    };
+    $("exec-tag-sel").onchange = onExecTagPick;
+    $("audit-host").onchange = loadAudit;
+    // ── host management ──
+    $("btn-host-save").onclick = saveHost;
+    $("btn-host-clear").onclick = clearHostForm;
+    $("btn-host-reload").onclick = () => { invalidateHosts(); loadHosts(); };
     $("btn-auto").onclick = () => {
       if (state.auto) {
         clearInterval(state.auto);
@@ -989,6 +1589,8 @@
       teardownPtyConnection();
       if (state.auto !== null) { clearInterval(state.auto); state.auto = null; }
       stopApprovalsPolling();
+      stopFleetAuto();
+      stopExecRetry();
     });
   }
 

@@ -70,6 +70,11 @@
               <b>终端</b>
               <i>真的 SSH 终端，能敲命令、能改窗口大小</i>
             </button>
+            <button class="pick-card" data-goto="fleet">
+              <span class="pick-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="1.8" width="5.2" height="5.2" rx="1"/><rect x="9" y="1.8" width="5.2" height="5.2" rx="1"/><rect x="1.8" y="9" width="5.2" height="5.2" rx="1"/><rect x="9" y="9" width="5.2" height="5.2" rx="1"/></svg></span>
+              <b>舰队</b>
+              <i>所有主机的状态、指标与批量执行</i>
+            </button>
             <button class="pick-card" data-goto="screen">
               <span class="pick-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1.2"/><path d="M5.5 14h5"/><path d="M8 11.5V14"/></svg></span>
               <b>画面</b>
@@ -113,6 +118,8 @@
   <nav class="tabs" id="tabs">
     <button data-view="council" class="on" title="圆桌会"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="4.6" r="1.9"/><circle cx="3.4" cy="11.4" r="1.6"/><circle cx="12.6" cy="11.4" r="1.6"/><path d="M6.8 6.1L4.5 10M9.2 6.1l2.3 3.9M5.2 11.6h5.6"/></svg></span></button>
     <button data-view="terminal" title="终端"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3.5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z"/><path d="M4 7l2 1.5L4 10"/><path d="M8 10.5h4"/></svg></span></button>
+    <button data-view="fleet" title="舰队"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="1.8" width="5.2" height="5.2" rx="1"/><rect x="9" y="1.8" width="5.2" height="5.2" rx="1"/><rect x="1.8" y="9" width="5.2" height="5.2" rx="1"/><rect x="9" y="9" width="5.2" height="5.2" rx="1"/></svg></span></button>
+    <button data-view="hosts" title="主机"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="2.2" width="12.4" height="4.6" rx="1"/><rect x="1.8" y="9.2" width="12.4" height="4.6" rx="1"/><path d="M4.4 4.5h.01M4.4 11.5h.01"/></svg></span></button>
     <button data-view="screen" title="画面"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1.2"/><path d="M5.5 14h5"/><path d="M8 11.5V14"/></svg></span></button>
     <button data-view="ops" title="运维"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 13.5h12"/><path d="M4.2 13.5V9M8 13.5V4.5M11.8 13.5v-6"/></svg></span></button>
     <button data-view="approvals" title="审批"><span class="tib"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8l5 1.9v4c0 3.2-2.1 5.4-5 6.5-2.9-1.1-5-3.3-5-6.5v-4l5-1.9z"/><path d="M5.9 7.9l1.5 1.5 2.8-2.9"/></svg></span><span class="badge" id="appr-badge" hidden>0</span></button>
@@ -232,6 +239,13 @@
       </div>
       <pre id="logs" class="logs muted">—</pre>
     </div>
+    <div class="card" style="margin-top:14px">
+      <div class="card-h">
+        <h3>审计</h3>
+        <select id="audit-host" class="sm"><option value="">全部主机</option></select>
+      </div>
+      <pre id="audit-entries" class="logs muted">—</pre>
+    </div>
   </section>
 
   <!-- 审批 -->
@@ -280,6 +294,83 @@
         补密钥的两条路：① 在服务器 <code>/etc/systemd/system/agentd.env</code> 里设置 <code>AGENTD_*</code> 变量并重启 agentd；
         ② 直接填 API Key（写入 <code>/var/lib/agentd/agentd.json</code>，权限 0600）。保存后点席位上的「探活」验证连通与解码档位。
       </p>
+    </div>
+  </section>
+
+  <!-- 舰队总览 + 批量执行 -->
+  <section class="view" id="view-fleet">
+    <div class="panel">
+      <b>舰队</b>
+      <span class="muted sm" id="fleet-summary">读取中…</span>
+      <span class="spacer"></span>
+      <button class="ghost sm" id="btn-fleet-auto">自动刷新·开</button>
+      <button class="ghost sm" id="btn-probe-all">全部探活</button>
+      <button class="ghost sm" id="btn-fleet-reload">刷新</button>
+    </div>
+
+    <div class="cols" id="fleet-grid"></div>
+    <div class="empty" id="fleet-empty" hidden>
+      <div class="empty-ico"><svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="1.8" width="5.2" height="5.2" rx="1"/><rect x="9" y="1.8" width="5.2" height="5.2" rx="1"/><rect x="1.8" y="9" width="5.2" height="5.2" rx="1"/><rect x="9" y="9" width="5.2" height="5.2" rx="1"/></svg></div>
+      <p><b>舰队里还没有主机。</b></p>
+      <p class="muted">去「主机」页添加第一台，回来这里就能看到整支舰队的状态。</p>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-h"><h3>批量执行</h3><span class="muted sm">命令经过同一道安全门；需要审批时会先送到审批页</span></div>
+      <div class="exec-row">
+        <div id="exec-hosts" class="exec-hosts"><span class="muted sm">正在读取主机…</span></div>
+        <select id="exec-tag-sel" class="sm"><option value="">按 tag 圈选…</option></select>
+      </div>
+      <div class="exec-row">
+        <input id="exec-cmd" placeholder="要在选中的主机上执行的命令，例如：systemctl is-active nginx" autocomplete="off" spellcheck="false">
+        <select id="exec-mode" class="sm">
+          <option value="parallel">并行</option>
+          <option value="rolling">滚动</option>
+        </select>
+      </div>
+      <div class="exec-row" id="exec-order-row" hidden>
+        <input id="exec-order" placeholder="滚动顺序：主机名逗号分隔（默认按勾选顺序）" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="seat-actions" style="margin-top:2px">
+        <button id="btn-exec-run" class="primary">执行</button>
+      </div>
+      <div id="exec-status" hidden></div>
+      <div id="exec-banner"></div>
+      <div id="exec-results" class="cols"></div>
+    </div>
+  </section>
+
+  <!-- 主机管理 -->
+  <section class="view" id="view-hosts">
+    <div class="panel">
+      <span class="muted sm">管理 agentd 能登录的主机。探活会连上去采集架构、内存、磁盘等实况；删除不可撤销，self（agentd 本机）不可删。</span>
+      <span class="spacer"></span>
+      <button class="ghost sm" id="btn-host-reload">刷新</button>
+    </div>
+
+    <div id="host-list" class="cols"></div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-h"><h3>添加 / 编辑主机</h3><span class="muted sm" id="host-form-mode">新增（同名会更新）</span></div>
+      <div class="seat-form">
+        <label>标签名<input id="host-label" placeholder="web-1 / db / self" autocomplete="off" spellcheck="false"></label>
+        <label>主机地址<input id="host-addr" placeholder="192.168.1.10 或 example.com" autocomplete="off" spellcheck="false"></label>
+        <label>端口<input id="host-port" type="number" placeholder="22" value="22" min="1" max="65535"></label>
+        <label>用户<input id="host-user" placeholder="root" autocomplete="off" spellcheck="false"></label>
+        <label>私钥路径<input id="host-keypath" placeholder="/root/.ssh/id_ed25519（留空用默认）" autocomplete="off" spellcheck="false"></label>
+        <label>密码环境变量<input id="host-passenv" placeholder="推荐：AGENTD_WEB1_PW（systemd 环境里配置）" autocomplete="off" spellcheck="false"></label>
+        <label>跳板机<input id="host-jump" placeholder="跳板机的标签名，如 bastion（可留空）" autocomplete="off" spellcheck="false"></label>
+        <label>策略<select id="host-policy">
+          <option value="standard">standard（标准）</option>
+          <option value="strict">strict（严格，审批更谨慎）</option>
+          <option value="permissive">permissive（宽松）</option>
+        </select></label>
+        <label>标签（逗号分隔）<input id="host-tags" placeholder="web, prod" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <div class="seat-actions">
+        <button id="btn-host-save" class="primary">保存主机</button>
+        <button id="btn-host-clear" class="ghost">清空表单</button>
+      </div>
     </div>
   </section>
 </main>

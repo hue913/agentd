@@ -458,6 +458,93 @@ select.sm, .ghost.sm { font-size: 12px; padding: 4px 9px; }
 .trace-body pre.err { border-color: rgba(232,115,125,.4); color: var(--bad); }
 .trace-body .sm { font-size: 11px; }
 
+/* ───────────────────  fleet · host management · exec-many  ─────────────────── */
+
+/* Policy badges: three fixed colors so a policy is readable at a glance.
+ * standard = neutral, strict = alarm red, permissive = accent blue. */
+.tag.pol-standard   { background: var(--panel-3); color: var(--fg-dim); }
+.tag.pol-strict     { background: rgba(232,115,125,.12); color: var(--bad); }
+.tag.pol-permissive { background: rgba(106,169,255,.12); color: var(--accent); }
+
+/* Host option in a <select> cannot carry a badge; the class tints the label. */
+#pty-host option.opt-strict, #audit-host option.opt-strict { color: var(--bad); }
+
+.fleet { cursor: pointer; transition: border-color .15s, transform .12s; }
+.fleet:hover { border-color: var(--accent); transform: translateY(-1px); }
+.fleet h4 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.lamp { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block; }
+.lamp.on  { background: var(--ok);  box-shadow: 0 0 0 3px rgba(78,201,160,.14); }
+.lamp.off { background: var(--bad); box-shadow: 0 0 0 3px rgba(232,115,125,.14); }
+.lamp.unk { background: var(--fg-faint); }
+
+.fleet-metrics {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px;
+  font: 11.5px/1.6 var(--mono); color: var(--fg-dim);
+  margin-top: 4px;
+}
+.fleet-metrics b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.fleet-last {
+  border-top: 1px solid var(--line-soft); margin-top: 8px; padding-top: 7px;
+  font: 11px var(--mono); color: var(--fg-faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.rc-ok  { color: var(--ok); }
+.rc-bad { color: var(--bad); }
+
+.host h4 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.host .meta { display: flex; flex-direction: column; gap: 4px; }
+.host .meta .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; }
+.host .meta code { background: #0a0c11; padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+.host .host-tags { display: flex; gap: 4px; flex-wrap: wrap; margin: 4px 0 2px; }
+.tag.tagchip { background: var(--panel-3); color: var(--fg-dim); }
+details.probe { margin-top: 6px; }
+details.probe summary { cursor: pointer; font-size: 11.5px; color: var(--accent); }
+details.probe pre {
+  margin: 6px 0 0; padding: 8px;
+  background: #0a0c11; border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font: 11px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all;
+  max-height: 220px; overflow: auto;
+}
+
+.exec-hosts { display: flex; flex-wrap: wrap; gap: 4px 14px; flex: 1; min-width: 0; }
+.exec-row { display: flex; gap: 8px; align-items: center; margin-bottom: 9px; flex-wrap: wrap; }
+.exec-row input { flex: 1; min-width: 220px; }
+#exec-order { font: 12px var(--mono); }
+
+.exec-status {
+  border: 1px solid var(--warn); background: rgba(230,180,80,.07);
+  border-radius: var(--r-sm); padding: 9px 11px; font-size: 12px;
+  margin: 4px 0 10px; display: flex; align-items: center; gap: 10px;
+}
+/* display:flex would beat the UA [hidden] rule (same trap as .badge) */
+.exec-status[hidden] { display: none; }
+.exec-status.error { border-color: var(--bad); background: rgba(232,115,125,.07); }
+
+.exec-card {
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: var(--r-sm); padding: 10px; min-width: 0;
+}
+/* Diff highlight: stdout of this host diverged from the reference host. */
+.exec-card.diff { border-color: var(--warn); box-shadow: 0 0 0 1px rgba(230,180,80,.35); }
+.exec-card .exec-h { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+.exec-card .exec-h b { font: 12.5px var(--mono); }
+.exec-card .exec-err { color: var(--bad); font-size: 11.5px; margin-bottom: 6px; }
+.exec-card pre {
+  margin: 0; padding: 8px;
+  background: #0a0c11; border: 1px solid var(--line-soft); border-radius: var(--r-sm);
+  font: 11px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all;
+  max-height: 220px; overflow: auto;
+}
+.exec-banner {
+  border: 1px solid var(--bad); background: rgba(232,115,125,.08);
+  color: var(--bad); border-radius: var(--r-sm);
+  padding: 8px 11px; font-size: 12px; margin-bottom: 10px;
+}
+
+button.ghost.off { opacity: .55; }
+
 /* ───────────────────  model seats page  ─────────────────── */
 .seat h4 { display: flex; align-items: center; gap: 6px; }
 .seat .seat-line { font: 12px var(--mono); color: var(--fg); margin: 0 0 4px; word-break: break-all; }
