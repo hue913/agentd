@@ -5,8 +5,12 @@ report, because the single most common complaint about agent tooling is a cost
 HUD that does not match the vendor bill.
 
 Ordering rule (matches how server-side prompt caching actually works):
-    tools -> fixed system instructions -> memory recall -> history -> live state
-Only the last block changes between steps, so the cached prefix stays valid.
+    tools -> fixed system instructions -> history -> live state -> memory recall
+Blocks are ordered by volatility: least-volatile first. Recall is frozen once
+per episode (loop.py snapshots it at episode start) and history only ever
+appends within an episode, so together with the fixed system prefix they form
+a byte-stable cached prefix; only the state block (and the candidate list the
+loop appends after it) is re-tokenized each step.
 """
 
 from __future__ import annotations
@@ -40,15 +44,20 @@ class PromptPlan:
 
 
 class ContextBuilder:
-    def __init__(self, history_window: int = 6, observation_budget_chars: int = 5_000,
+    def __init__(self, history_budget_chars: int = 6_000, observation_budget_chars: int = 5_000,
                  compact: bool = True):
-        self.history_window = history_window
+        # History is append-only within an episode: a sliding window rewrites the
+        # head of the user block every step, which invalidates the cached prefix
+        # the history block exists to protect. The char budget only kicks in for
+        # pathological episodes (default 6000 chars ≈ far more than max_steps=12
+        # ever produces).
+        self.history_budget = history_budget_chars
         self.observation_budget = observation_budget_chars
         self.compact = compact
 
     def build(self, instructions: str, catalog: str, recall: list[str], history: list[str],
               state: str, scope: str = "") -> PromptPlan:
-        """Assemble the prompt so that only `state` differs step to step."""
+        """Assemble the prompt so volatility increases towards the tail."""
         fixed = []
         if catalog:
             fixed.append(f"# tools\n{catalog}")
@@ -57,19 +66,20 @@ class ContextBuilder:
             fixed.append(f"# scope\n{scope}")
         prefix = "\n\n".join(fixed)
 
-        # Memory recall sits after the immutable prefix: it changes per state, but
-        # far less than the raw observation, so keeping history ahead of the state
-        # still preserves the useful part of the cache.
+        # Within the user block the same volatility rule applies: append-only
+        # history first, then the per-step state, then episode-frozen recall last.
+        # Candidates (even more volatile) are appended by the loop after recall.
         tail_blocks = []
-        if recall:
-            tail_blocks.append("# what worked here before\n" + "\n".join(f"- {line}" for line in recall))
-        if history:
-            window = history[-self.history_window:]
-            tail_blocks.append("# recent steps\n" + "\n".join(f"{i+1}. {h}" for i, h in enumerate(window)))
+        history_block = self._history_block(history)
+        if history_block:
+            tail_blocks.append(history_block)
 
         compacted, stats = (compact_observation(state, self.observation_budget)
                             if self.compact else (state, {}))
-        tail_blocks.append(f"# current state\n{compacted}")
+        if state:
+            tail_blocks.append(f"# current state\n{compacted}")
+        if recall:
+            tail_blocks.append("# what worked here before\n" + "\n".join(f"- {line}" for line in recall))
 
         system = prefix
         user = "\n\n".join(tail_blocks)
@@ -80,6 +90,26 @@ class ContextBuilder:
             prefix_hash=hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:12],
             savings=stats,
         )
+
+    def _history_block(self, history: list[str]) -> str:
+        """Render the full step history, truncating the OLDEST entries on budget.
+
+        Truncation is bounded: with the default 6000-char budget and max_steps=12
+        it never fires, so within an episode the block only ever grows at the tail.
+        """
+        if not history:
+            return ""
+        entries = [f"{i + 1}. {h}" for i, h in enumerate(history)]
+        body = "\n".join(entries)
+        if len(body) > self.history_budget:
+            dropped = 0
+            while entries and len("\n".join(entries)) > self.history_budget:
+                entries.pop(0)
+                dropped += 1
+            # Keep the original numbering so the model can still see how far
+            # into the episode it is; the marker says why the count starts late.
+            body = f"[{dropped} earlier steps omitted]\n" + "\n".join(entries)
+        return "# recent steps\n" + body
 
 
 def compact_observation(text: str, budget_chars: int = 5_000) -> tuple[str, dict]:

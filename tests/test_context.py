@@ -48,7 +48,7 @@ def test_empty_and_oversized_inputs_are_safe():
 
 
 def test_prefix_is_stable_across_steps_so_caching_can_work():
-    builder = ContextBuilder(history_window=2)
+    builder = ContextBuilder()
     common = dict(instructions="Fix the server without destroying data.", catalog="ssh.exec: run a command")
     first = builder.build(state="nginx is down on app-01", history=[], recall=[], **common)
     second = builder.build(state="nginx restarted, healthcheck pending",
@@ -56,15 +56,26 @@ def test_prefix_is_stable_across_steps_so_caching_can_work():
                            **common)
     assert first.prefix_hash == second.prefix_hash
     assert first.system == second.system
-    assert "current state" in second.user and second.user.index("current state") > second.user.index("recent steps")
+    # volatility order: history -> state -> recall
+    assert second.user.index("recent steps") < second.user.index("current state") < second.user.index("what worked here before")
     assert first.est_prompt_tokens == estimate_tokens(first.system + first.user)
 
 
-def test_history_window_bounds_the_prompt():
-    builder = ContextBuilder(history_window=3)
+def test_history_char_budget_bounds_the_prompt():
+    builder = ContextBuilder(history_budget_chars=400)
     plan = builder.build(instructions="i", catalog="c", recall=[],
-                         history=[f"step {i}" for i in range(50)], state="s")
-    assert "step 47" in plan.user and "step 46" not in plan.user
+                         history=[f"step {i} did something distinct and long enough to add up" for i in range(50)],
+                         state="s")
+    assert "earlier steps omitted" in plan.user
+    assert len(plan.user) < 1200
+
+
+def test_history_budget_never_triggers_for_normal_episodes():
+    builder = ContextBuilder()
+    plan = builder.build(instructions="i", catalog="c", recall=[],
+                         history=[f"chose action {i} -> ok" for i in range(12)], state="s")
+    assert "earlier steps omitted" not in plan.user
+    assert "1. chose action 0" in plan.user
 
 
 def test_ledger_reports_cache_hits_and_costs():

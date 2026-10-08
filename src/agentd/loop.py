@@ -144,14 +144,23 @@ class AgentLoop:
             # An enumerable environment already bounded its own option set; truncating
             # it here would silently delete the action the task requires.
             return list(provided), "environment"
-        prompt = (f"{state}\n\n" + PROPOSE_INSTRUCTION.format(k=self.config.propose_k))
+        # Fixed blocks go FIRST, mirroring ContextBuilder.build's ordering: the
+        # catalog and mission are step-invariant, so leading with them lets a
+        # propose call share its longest prefix with the choose call of the same
+        # step and with previous steps' propose calls (provider prefix caches
+        # key on exactly that).
+        head = []
+        catalog = self.bus.catalog(token_budget=self.catalog_budget)
+        if catalog:
+            head.append(f"# tools\n{catalog}")
+        head.append(f"# mission\nTask: {task.goal()}")
+        prompt = "\n\n".join(head)
+        prompt += f"\n\n# state\n{state}\n\n" + PROPOSE_INSTRUCTION.format(k=self.config.propose_k)
         hint = getattr(task, "propose_hint", "")
         if hint:
-            # A tool-driven task proposes real calls: the model needs the tool
-            # names and the accepted action grammar in the same breath as the ask.
-            catalog = self.bus.catalog(token_budget=600, style="text")
-            if catalog:
-                prompt += "\n\nAvailable tools:\n" + catalog
+            # A tool-driven task proposes real calls: the model needs the accepted
+            # action grammar in the same breath as the ask (the tool names are
+            # already in the leading catalog).
             prompt += "\n\n" + hint
         if hasattr(self.provider, "text"):
             try:
@@ -236,9 +245,12 @@ class AgentLoop:
         report = EpisodeReport(task=task.name, scope=task.scope, episode_id=recorder.episode_id)
         history: list[str] = []
         council_outcomes: list = []
+        # Frozen once per episode: recall sits at the very end of the user block,
+        # so re-querying it every step would rewrite the prompt tail each step and
+        # defeat the prefix cache the context ordering is built for.
+        recall = self.kernel.analyses_for(task.name)
 
         for _ in range(self.config.max_steps):
-            recall = self.kernel.analyses_for(task.name)
             try:
                 outcome = self.step(task, state, history, recall, ctx)
             except ProviderError as exc:
