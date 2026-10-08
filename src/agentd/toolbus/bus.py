@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import time
 from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
 
 from .spec import RISK_DANGEROUS, ToolResult, ToolSpec, validate_args
 
@@ -26,15 +27,47 @@ def _accepts_ctx(handler) -> bool:
     return "ctx" in params
 
 
+# Minimal structural contracts for the collaborators that ride on CallContext.
+# They replace bare `object` annotations: tools get honest types without the
+# bus importing their concrete modules (SSHHub, AuditLog, JitRLKernel), which
+# would drag heavy imports — and a circular one via runtime — into the bus.
+@runtime_checkable
+class Approver(Protocol):
+    """A human-in-the-loop check; True means the request was explicitly allowed."""
+
+    def __call__(self, request: dict) -> bool: ...
+
+
+@runtime_checkable
+class AuditSink(Protocol):
+    def write(self, record: object) -> None: ...
+
+
+@runtime_checkable
+class SSHHubLike(Protocol):
+    """The slice of SSHHub tool handlers actually depend on."""
+
+    def exec(self, label: str, command: str, **kwargs) -> object: ...
+
+    def hosts(self) -> list[str]: ...
+
+
+@runtime_checkable
+class KernelLike(Protocol):
+    """The store-reading slice of the kernel handlers may consult."""
+
+    def stats(self) -> dict: ...
+
+
 @dataclass
 class CallContext:
     session: str = "default"
     episode_id: int | None = None
     approved: bool = False
-    approver: object = None            # callable(dict) -> bool
-    ssh: object = None                 # envs.ssh_env.SSHHub, when available
-    audit: object = None
-    kernel: object = None
+    approver: Approver | None = None
+    ssh: SSHHubLike | None = None
+    audit: AuditSink | None = None
+    kernel: KernelLike | None = None
     extra: dict = field(default_factory=dict)
 
 
