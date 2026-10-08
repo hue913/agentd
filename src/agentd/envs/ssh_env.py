@@ -25,7 +25,11 @@ import time
 from dataclasses import dataclass, field
 
 from ..safety.audit import AuditLog, AuditRecord
-from ..safety.gate import LEVEL_ALLOW, Verdict, classify, initial_readonly
+from ..safety.gate import LEVEL_ALLOW, LEVEL_CONFIRM, Verdict, classify, initial_readonly
+
+# Per-host enforcement tiers (fleet F4). The gate verdict itself is global and
+# untouched; the policy only decides how that verdict is enforced per host.
+POLICIES = ("standard", "strict", "permissive")
 
 DEFAULT_TIMEOUT = 60
 MAX_CAPTURE = 200_000
@@ -81,6 +85,17 @@ class HostSpec:
     password_env: str = ""          # NAME of an env var holding the secret, never the secret
     jump: str = ""                  # label of a bastion to ProxyJump through
     use_login_shell: bool = False   # bash -lc imports profile PATH noise; off unless asked
+    # Fleet fields. "standard" keeps the global gate semantics; "strict" forces
+    # the two-phase approval flow for anything not provably read-only;
+    # "permissive" only enforces block-level rules (audited, never silent).
+    policy: str = "standard"
+    tags: list[str] = field(default_factory=list)   # fleet grouping / tag:xxx selectors
+    # Optional custom metrics collector. DANGER: it runs on the remote host with
+    # that host's credentials, so it is never treated as trusted — it passes the
+    # gate like any model-authored command, and anything not provably read-only
+    # needs a one-shot human approval before it runs. Keep it to read-only
+    # collectors (df, free, ...) and never paste secrets into it.
+    metrics_cmd: str = ""
 
     def target(self) -> str:
         return f"{self.user}@{self.host}" if self.user else self.host
@@ -134,6 +149,15 @@ class SSHHub:
                 "(declare it in agentd.json under ssh_hosts)"
             )
         return spec
+
+    def remove_host(self, label: str) -> None:
+        """Drop a host from the live registry (config stays the source of truth).
+
+        Removal is hot but not violent: sessions that already reference the
+        label simply fail with a clean `unknown host` on their next exec —
+        nothing is force-killed and no in-flight command is interrupted.
+        """
+        self._hosts.pop(label, None)
 
     # -- argv ------------------------------------------------------------
     def _ssh_base(self, label: str, for_copy: bool = False) -> list[str]:
@@ -190,26 +214,48 @@ class SSHHub:
     # -- execution --------------------------------------------------------
     def exec(self, label: str, command: str, timeout: int = DEFAULT_TIMEOUT, approved: bool = False,
              stdin: str | None = None, session: str | None = None,
-             episode_id: int | None = None) -> ExecResult:
+             episode_id: int | None = None, action: str | None = None) -> ExecResult:
         spec = self.get_host(label)
         verdict = classify(command)
+        # Per-host enforcement tier (fleet F4). `policy` decides how the global
+        # gate verdict is enforced for this host; the verdict itself is shared.
+        policy = (getattr(spec, "policy", "") or "standard").strip().lower()
+        if policy not in POLICIES:
+            policy = "standard"     # unknown value: fall back to the safe default
+        permissive_auto = False
+
+        def _deny(error: str) -> ApprovalRequired:
+            """Audit the refusal, then raise — a denial must leave a record."""
+            self.audit.write(AuditRecord(host=label, command=command, level=verdict.level,
+                                         reasons=verdict.reasons, session=session,
+                                         episode_id=episode_id, error=error,
+                                         action=action or ""))
+            return ApprovalRequired(label, command, verdict)
 
         if verdict.hard_blocked and not approved:
-            self.audit.write(AuditRecord(host=label, command=command, level="block",
-                                         reasons=verdict.reasons, session=session,
-                                         episode_id=episode_id, error="blocked by gate"))
-            raise ApprovalRequired(label, command, verdict)
+            raise _deny("blocked by gate")
 
-        if verdict.level == "confirm" and not approved:
-            if not self._granted(label, command, verdict):
-                self.audit.write(AuditRecord(host=label, command=command, level="confirm",
-                                             reasons=verdict.reasons, session=session,
-                                             episode_id=episode_id, error="awaiting approval"))
-                raise ApprovalRequired(label, command, verdict)
-
-        if not approved and verdict.level == LEVEL_ALLOW and not initial_readonly(command):
-            if not self._granted(label, command, verdict):
-                raise ApprovalRequired(label, command, verdict)
+        if policy == "strict":
+            # Strict hosts force the explicit two-phase approval flow for every
+            # command that is not provably read-only, whatever the gate decided:
+            # the inline approver shortcut is bypassed, the request is audited,
+            # and only a human re-run with approved=True executes it.
+            if not approved and not initial_readonly(command):
+                raise _deny("host policy 'strict' requires explicit approval")
+        elif policy == "permissive":
+            # Permissive hosts only enforce block-level rules; confirm-level and
+            # unprovable commands run without a human, but the audit record gets
+            # a marker so the relaxation is never silent.
+            if not approved and (verdict.level == LEVEL_CONFIRM
+                                 or not initial_readonly(command)):
+                permissive_auto = True
+        else:  # standard: the historical gate behaviour, byte for byte
+            if verdict.level == LEVEL_CONFIRM and not approved:
+                if not self._granted(label, command, verdict, policy):
+                    raise _deny("awaiting approval")
+            if not approved and verdict.level == LEVEL_ALLOW and not initial_readonly(command):
+                if not self._granted(label, command, verdict, policy):
+                    raise _deny("awaiting approval")
 
         shell = "bash -lc" if spec.use_login_shell else "sh -c"
         argv = self._ssh_base(label) + [spec.target(), f"{shell} {shlex.quote(command)}"]
@@ -240,13 +286,17 @@ class SSHHub:
                                      reasons=verdict.reasons,
                                      approved_by="human" if approved else None, rc=rc,
                                      stdout_len=len(out), error=err.strip() or None,
-                                     session=session, episode_id=episode_id))
+                                     session=session, episode_id=episode_id,
+                                     action=action or ("policy=permissive auto-approved"
+                                                       if permissive_auto else None)))
         return result
 
-    def _granted(self, label: str, command: str, verdict: Verdict) -> bool:
+    def _granted(self, label: str, command: str, verdict: Verdict,
+                 policy: str = "standard") -> bool:
         if self.approver is None:
             return False
-        return bool(self.approver({"host": label, "command": command, **verdict.as_dict()}))
+        return bool(self.approver({"host": label, "command": command, "policy": policy,
+                                   **verdict.as_dict()}))
 
     def probe(self, label: str, timeout: int = 25) -> dict:
         """Static inventory used to decide what this host can host (P0-1 gate)."""

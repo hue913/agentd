@@ -288,6 +288,86 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
             _report_upstream("ssh.probe", exc)
             raise HTTPException(502, "upstream ssh probe failed")
 
+    # -- fleet: multi-host management --------------------------------------
+    # Host CRUD is config-backed like the provider seats: agentd.json is
+    # read-modify-written whole (never replaced), the hub is updated hot, and
+    # the runtime's save_config() handles the atomic tmp+rename+.bak write.
+
+    @app.get("/api/hosts")
+    def fleet_hosts(tag: str = ""):
+        return {"hosts": rt.fleet.host_summaries(tag=tag or None)}
+
+    @app.post("/api/hosts", status_code=201)
+    def fleet_host_add(body: dict):
+        try:
+            return {"host": rt.add_host(body)}
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except OSError as exc:
+            raise HTTPException(500, f"could not write the config file: {exc}")
+
+    @app.patch("/api/hosts/{label}")
+    def fleet_host_patch(label: str, body: dict):
+        try:
+            return {"host": rt.update_host(label, body)}
+        except SSHError:
+            raise HTTPException(404, f"no host named '{label}'")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except OSError as exc:
+            raise HTTPException(500, f"could not write the config file: {exc}")
+
+    @app.delete("/api/hosts/{label}")
+    def fleet_host_delete(label: str):
+        try:
+            rt.remove_host(label)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except (KeyError, SSHError):
+            raise HTTPException(404, f"no host named '{label}'")
+        except OSError as exc:
+            raise HTTPException(500, f"could not write the config file: {exc}")
+        return {"ok": True}
+
+    @app.post("/api/hosts/{label}/probe")
+    async def fleet_host_probe(label: str):
+        if label not in rt.ssh.hosts():
+            raise HTTPException(404, f"no host named '{label}'")
+        try:
+            return await asyncio.to_thread(rt.ssh.probe, label)
+        except SSHError as exc:
+            raise HTTPException(502, str(exc))
+        except Exception as exc:
+            _report_upstream("fleet.probe", exc)
+            raise HTTPException(502, "upstream ssh probe failed")
+
+    @app.get("/api/hosts/{label}/metrics")
+    async def fleet_host_metrics(label: str, force: bool = False):
+        if label not in rt.ssh.hosts():
+            raise HTTPException(404, f"no host named '{label}'")
+        # A cold collect runs the remote probe (8s budget): leave the event loop.
+        return await asyncio.to_thread(rt.fleet.metrics_report, label, force)
+
+    @app.post("/api/hosts/exec-many")
+    async def fleet_exec_many(body: dict):
+        labels, command = body.get("labels"), body.get("command")
+        if not isinstance(labels, list) or not labels:
+            raise HTTPException(400, "body needs a non-empty 'labels' list")
+        if not command or not str(command).strip():
+            raise HTTPException(400, "body needs 'command'")
+        try:
+            report = await asyncio.to_thread(
+                rt.fleet.exec_many, labels, str(command),
+                str(body.get("mode", "parallel")), body.get("order"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        # 202 keeps the same blocked semantics as /api/ssh/exec: the request was
+        # understood but waits on (or was refused by) a human.
+        if report.get("blocked"):
+            return JSONResponse({"blocked": True, "reason": report.get("reason", "")},
+                                status_code=202)
+        return report
+
     @app.post("/api/util/compact")
     async def compact(body: dict):
         text = body.get("text", "")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -15,7 +16,8 @@ from pathlib import Path
 from .context import ContextBuilder, Ledger
 from .council import Council, TriggerPolicy
 from .envs.ops_tasks import BUILTIN_TASKS
-from .envs.ssh_env import HostSpec, SSHHub
+from .envs.ssh_env import POLICIES, HostSpec, SSHError, SSHHub
+from .fleet import Fleet
 from .kernel import JitRLKernel, Store
 from .log import get_logger
 from .loop import AgentLoop, LoopConfig
@@ -95,6 +97,12 @@ class Runtime:
         self.screen[1].actions = self.screen_actions
         for host in self.config.get("ssh_hosts", []):
             self.ssh.add_host(HostSpec(**host))
+        # Fleet management: metrics cache + background health polling + batch
+        # execution, all riding on the same hub/approver as the SSH tools.
+        # Polling starts with the runtime (like the PTY reaper) so the fleet
+        # page shows liveness even before anyone opens it.
+        self.fleet = Fleet(self.ssh, audit=self.audit, approver=self._ask_human)
+        self.fleet.start_polling()
         self.providers = self._build_providers()
         self.kernel = self._build_kernel(enabled=True)
         self.extensions = self._load_extensions()
@@ -228,6 +236,127 @@ class Runtime:
 
     def reload_providers(self) -> None:
         self.providers = self._build_providers()
+
+    # -- fleet host management (config-backed, hot-applied) ----------------
+    _LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+    _HOST_EDITABLE = ("host", "port", "user", "key_path", "password_env", "jump",
+                      "use_login_shell", "policy", "tags", "metrics_cmd")
+
+    def _host_state(self, label: str) -> dict:
+        """One row for runtime.state(): identity, policy and cached liveness."""
+        spec = self.ssh.get_host(label)
+        return {
+            "label": label,
+            "host": spec.host,
+            "policy": (getattr(spec, "policy", "") or "standard"),
+            "tags": list(getattr(spec, "tags", []) or []),
+            "online": self.fleet.online(label),
+        }
+
+    def _host_spec_dict(self, spec: HostSpec) -> dict:
+        """Config-file shape of a host (round-trips through HostSpec(**entry))."""
+        return {
+            "label": spec.label, "host": spec.host, "port": spec.port, "user": spec.user,
+            "key_path": spec.key_path, "password_env": spec.password_env, "jump": spec.jump,
+            "use_login_shell": spec.use_login_shell,
+            "policy": (getattr(spec, "policy", "") or "standard"),
+            "tags": list(getattr(spec, "tags", []) or []),
+            "metrics_cmd": (getattr(spec, "metrics_cmd", "") or ""),
+        }
+
+    def _validate_host_fields(self, fields: dict) -> dict:
+        """Validate the editable host fields; returns clean HostSpec kwargs."""
+        out: dict = {}
+        address = str(fields.get("host") or "").strip()
+        if not address or any(c.isspace() for c in address):
+            raise ValueError("'host' must be a non-empty address without whitespace")
+        out["host"] = address
+        try:
+            port = int(fields.get("port", 22))
+        except (TypeError, ValueError):
+            raise ValueError("'port' must be an integer")
+        if not 1 <= port <= 65535:
+            raise ValueError("'port' must be within 1..65535")
+        out["port"] = port
+        out["user"] = str(fields.get("user") or "").strip()
+        out["key_path"] = str(fields.get("key_path") or "").strip()
+        out["password_env"] = str(fields.get("password_env") or "").strip()
+        out["jump"] = str(fields.get("jump") or "").strip()
+        policy = str(fields.get("policy") or "standard").strip().lower()
+        if policy not in POLICIES:
+            raise ValueError(f"unknown policy '{policy}'. known: {', '.join(POLICIES)}")
+        out["policy"] = policy
+        tags = fields.get("tags") or []
+        if not isinstance(tags, list) or any(not isinstance(t, str) for t in tags):
+            raise ValueError("'tags' must be a list of strings")
+        cleaned: list[str] = []
+        for tag in tags:
+            tag = tag.strip()
+            if tag and tag not in cleaned:
+                cleaned.append(tag)
+        out["tags"] = cleaned
+        # metrics_cmd is free-form on purpose, but it executes remotely with the
+        # host's credentials: the fleet module gate-checks it and demands a
+        # one-shot approval unless it is provably read-only. See fleet.py.
+        out["metrics_cmd"] = str(fields.get("metrics_cmd") or "").strip()
+        return out
+
+    def add_host(self, body: dict) -> dict:
+        """Register a host: validate, hot-add to the hub, persist to agentd.json."""
+        label = str(body.get("label") or "").strip()
+        if not self._LABEL_RE.match(label):
+            raise ValueError("host label must start with a letter and use letters, digits, "
+                             "'-', '_' or '.' (max 64 chars)")
+        if label == "self":
+            raise ValueError("'self' is reserved for the local host and cannot be registered")
+        hosts = list(self.config.get("ssh_hosts") or [])
+        if any(h.get("label") == label for h in hosts):
+            raise ValueError(f"a host named '{label}' already exists")
+        fields = self._validate_host_fields(body)
+        if fields["jump"] and fields["jump"] not in self.ssh.hosts():
+            raise ValueError(f"jump host '{fields['jump']}' is not registered")
+        spec = HostSpec(label=label, **fields)
+        self.config["ssh_hosts"] = hosts + [self._host_spec_dict(spec)]
+        self.ssh.add_host(spec)     # hot: usable without a restart
+        self.save_config()
+        return self._host_spec_dict(spec)
+
+    def update_host(self, label: str, body: dict) -> dict:
+        """Partially update a host; unknown fields are refused, not ignored."""
+        if label not in self.ssh.hosts():
+            raise SSHError(f"unknown host '{label}'")
+        unknown = [k for k in body if k not in self._HOST_EDITABLE and k != "label"]
+        if unknown:
+            raise ValueError(f"unknown field(s): {', '.join(sorted(unknown))}")
+        merged = {**self._host_spec_dict(self.ssh.get_host(label)),
+                  **{k: body[k] for k in body if k in self._HOST_EDITABLE}}
+        fields = self._validate_host_fields(merged)
+        if fields["jump"] and fields["jump"] not in self.ssh.hosts() and fields["jump"] != label:
+            raise ValueError(f"jump host '{fields['jump']}' is not registered")
+        spec = HostSpec(label=label, **fields)
+        hosts = [h for h in (self.config.get("ssh_hosts") or []) if h.get("label") != label]
+        self.config["ssh_hosts"] = hosts + [self._host_spec_dict(spec)]
+        self.ssh.add_host(spec)     # hot: replaces the old spec in place
+        self.save_config()
+        return self._host_spec_dict(spec)
+
+    def remove_host(self, label: str) -> dict:
+        """Forget a host in config and hub; running sessions are never killed."""
+        if label == "self":
+            raise ValueError("the 'self' host cannot be removed")
+        hosts = list(self.config.get("ssh_hosts") or [])
+        remaining = [h for h in hosts if h.get("label") != label]
+        in_config = len(remaining) != len(hosts)
+        in_hub = label in self.ssh.hosts()
+        if not in_config and not in_hub:
+            raise KeyError(label)
+        if in_config and not remaining:
+            raise ValueError("cannot remove the last host in the fleet")
+        self.config["ssh_hosts"] = remaining
+        if in_hub:
+            self.ssh.remove_host(label)
+        self.save_config()
+        return {"ok": True, "removed": label}
 
     def save_config(self) -> None:
         """Persist the runtime config atomically (0600) keeping one backup.
@@ -494,7 +623,9 @@ class Runtime:
             "capabilities": caps,
             "kernel": self.kernel.stats(),
             "tools": {"count": len(self.bus.names()), "by_source": self.bus.by_source()},
-            "hosts": self.ssh.hosts(),
+            # Structured host rows (label/policy/tags/liveness) so the console
+            # dropdown and the fleet page share one source of truth.
+            "hosts": [self._host_state(label) for label in self.ssh.hosts()],
             "tasks": sorted(BUILTIN_TASKS),
             "extensions": self.extensions,
             "sessions": [{"id": s.id, "task": s.task, "status": s.status} for s in self.sessions.values()],
@@ -505,6 +636,7 @@ class Runtime:
         }
 
     def close(self) -> None:
+        self.fleet.stop_polling()
         self.pty.stop_reaper()
         for server in self._mcp_servers.values():
             server.stop()
