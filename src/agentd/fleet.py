@@ -426,8 +426,12 @@ class Fleet:
                    "labels": list(resolved), "command": command, "mode": mode,
                    "risk": "batch command on multiple hosts", "policy": "standard"}
         if not self._approved(payload):
-            reason = ("batch execution requires approval" if self.approver
-                      else "no approver configured")
+            # The approver callback collapses "human clicked deny" and "nobody
+            # answered in time" into one False, so the message covers both —
+            # wording it as "requires approval" would read wrong after an
+            # explicit denial.
+            reason = ("batch execution was not approved (declined or approval timed out)"
+                      if self.approver else "no approver configured")
             record["result"] = {"blocked": True, "reason": reason}
             if self.audit is not None:
                 self.audit.write(AuditRecord(host=", ".join(resolved), command=command,
