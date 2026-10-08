@@ -2,18 +2,26 @@
 
 **English** · [中文](README.zh-CN.md)
 
-**An agent that gets better without being trained.**
+**agentd is a server agent that gets better as it works. No training, no GPU.**
 
-It stores every action it takes together with the return that followed, retrieves the
-situations it has already lived through, estimates the advantage of each option, and biasing
-the model's own next-token probabilities: `z'(s,a) = z(s,a) + β·Â(s,a)`. No gradients, no
-fine-tuning, no GPU rental, no API key required to see the mechanism work.
+Three things you can do with it:
 
-Then you point it at your servers: a real interactive SSH terminal, a live view of the
-machine's screen, multi-model councils that argue before they decide, and a safety gate
-that will not let `rm -rf` through without a human.
+1. **Put LLMs to work on your servers.** Point it at any model — an OpenAI-compatible
+   endpoint (your own relay counts) or native Anthropic / Gemini. Models act through real
+   tools: SSH, shell, files. Dangerous commands pass a safety gate and wait for your click.
+2. **Watch it work.** A real interactive terminal, a live view of the machine's screen, and
+   a step-by-step trace, all in one browser console. One SSH tunnel reaches it; the server
+   exposes no public ports.
+3. **Let it improve.** It records what each action earned and does better next time in
+   similar situations. You can verify that mechanism yourself with no API key at all.
 
-It runs on a $5 VPS. It runs keyless. It runs today.
+Pick your path:
+
+- Want to run it now → [60 seconds](#60-seconds)
+- Want the numbers → [Measured results](#measured-results)
+- Want the mechanism → [How it works](#how-it-works)
+
+It runs on a $5 VPS.
 
 [![ci](https://github.com/hue913/agentd/actions/workflows/ci.yml/badge.svg)](https://github.com/hue913/agentd/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
@@ -27,7 +35,9 @@ It runs on a $5 VPS. It runs keyless. It runs today.
 
 ---
 
-## 60 seconds, no API key, no GPU, no network
+## 60 seconds
+
+Install it, then two commands to watch it learn. No API key, no network.
 
 ```bash
 git clone https://github.com/hue913/agentd && cd agentd
@@ -35,94 +45,47 @@ python3.11 -m venv .venv && . .venv/bin/activate
 pip install -e ".[api]"
 
 agentd demo                     # watch memory flip decisions, keyless
-agentd bench --episodes 40      # the two curves below
+agentd bench --episodes 40      # success rate with and without memory
 ```
+
+You will see two lines:
 
 ```
 learning OFF (control)   1/40 (  2.5%)    1st half  5.0%   2nd half  0.0%
 learning ON  (JitRL)    11/40 ( 27.5%)    1st half  0.0%   2nd half 55.0%
 ```
 
-Not a lucky seed. Across **12 seeds × 40 episodes** on the same suite: control averages
-**1.1/40**, learning averages **14.4/40**, learning is strictly better in **11 of 12**
-seeds — the twelfth is a tie where neither arm ever succeeds. Seed-to-seed spread is wide
-(0 to 30), which is why the command prints both halves of the curve: the mechanism shows up
-as a trend, not as a single number.
+How to read it: without memory, the control arm wins 1 of 40 episodes. With memory, 11 —
+and the second-half success rate climbs. That is the memory working. For results beyond a
+single seed, see [Measured results](#measured-results).
 
-```bash
-for s in $(seq 1 12); do agentd bench --episodes 40 --seed $s | sed -n 3,4p; done
-```
-
-### And on real web pages
-
-`--suite web` drives actual Chromium through Playwright over six MiniWoB-shaped tasks
-(numbered elements, one goal, a DOM checker deciding reward — the page decides, not a model
-grading itself). It runs keyless with a lexical baseline policy:
-
-| seed | memory OFF | memory ON | delta |
-|---|---|---|---|
-| 7  | 20/60 | 19/60 | −0.02 |
-| 21 | 18/60 | 23/60 (2nd half .27 → **.50**) | +0.08 |
-| 33 | 18/60 | 29/60 | +0.18 |
-| | mean 18.7/60 | mean 23.7/60 | **mean +0.08** |
-
-Read that honestly: on real pages the gain is **modest and seed-dependent** — advantage can
-only amplify successes the base policy occasionally reaches, and three of the six tasks are
-beyond the lexical baseline entirely. `--policy model` with a real endpoint is where the
-comparison gets sharp, and the command prints which policy produced the numbers so nobody
-can mistake the baseline for a language model.
-
----
-
-## Why "without being trained" is the point
-
-Deployed LLM agents have frozen weights: they repeat mistakes forever, and conventional RL
-fixes that with the two costs you cannot pay on a small box — compute and catastrophic
-forgetting.
-
-[**JitRL** (Just-In-Time Reinforcement Learning, arXiv:2601.18510)](https://arxiv.org/abs/2601.18510)
-moves the RL to *inference time*: a dynamic, non-parametric memory of `<state, action,
-reward>` triplets, retrieval of similar past trajectories, an on-the-fly advantage estimate,
-and a direct additive modulation of the output logits — for which the paper proves the exact
-closed-form solution to the KL-constrained policy objective. It beats fine-tuning baselines
-(WebRL) on WebArena *without any training*, at a fraction of the cost.
-
-**agentd is an independent, productised implementation of that idea** — built for operators
-rather than for a benchmark table. Where it deviates from the reference implementation, it
-says so: retrieval here is lexical (Jaccard n-grams over an inverted index, zero embedding
-calls), a deliberate cheap subset of the paper's BM25 + embedding + LLM-scored stack; the
-advantage and exploration terms follow the published equations (including the
-"recompute-baseline" detail and the fixed ε=0.05 the published path actually uses).
-
-The rest of the loop is Reflexion-shaped: at the end of an episode the agent writes itself a
-two-sentence critique, stores it, and recalls it the next time a similar situation appears.
-
-## What it does
+## What it can do
 
 | | |
 |---|---|
 | **Learns while running** | `(state, action, discounted_return)` triplets in SQLite; n-gram retrieval with an inverted index; advantage re-ranking; verbal self-critique stored and recalled. Per-memory credit accounting shows which memories actually get adopted |
-| **Any model you want** | one `base_url + api_key + model` — an OpenAI-compatible endpoint (your own relay included) or a native Anthropic / Gemini seat. Seats are managed live from the console or `POST /api/providers`; a capability probe picks the decode tier per endpoint and a missing key makes that seat *abstain out loud*, never fail silently |
+| **Any model you want** | one `base_url + api_key + model` — an OpenAI-compatible endpoint or a native Anthropic / Gemini seat. Seats are managed live from the console or `POST /api/providers`; a capability probe picks the decode tier per endpoint; a missing key makes that seat abstain out loud, never fail silently |
 | **Operates your servers** | SSH through the system `ssh`/`scp` (inherits `~/.ssh/config`, agent, `ProxyJump`), an interactive PTY terminal served over WebSocket, resumable uploads with md5 reconciliation |
 | **An agent loop that acts** | open goals (`kind:"ops"`) run through the tool bus: the model proposes real calls — `ssh.exec {"host":"self","command":"df -h"}`, `ssh.exec df -h`, `finish {...}` — and every one passes the safety gate before execution |
-| **You can see it work** | `Xvfb + x11vnc + noVNC` reached only through an SSH tunnel; the screen panel also states plainly when no vision model is attached instead of implying it saw something |
+| **You can see it work** | `Xvfb + x11vnc + noVNC` reached only through an SSH tunnel; the screen panel states plainly when no vision model is attached |
 | **Refuses to destroy things** | every command is classified before execution; `rm -rf`, `mkfs`, `DROP TABLE`, force-push, `curl \| sh` etc. need a human approval, with the pending request showing command, reasons and host |
-| **Multi-model councils** | independent proposals → cross-examination under a permission boundary → adjudication. Dissent is rendered as its own block and never averaged into a fake consensus |
-| **Extensible four ways** | built-in tools, drop-in Python plugins, `SKILL.md` skill packs, and any MCP server — plus agentd itself **is** an MCP server |
+| **Multi-model councils** | independent proposals → cross-examination under a boundary → adjudication. Dissent is rendered as its own block and never averaged into a fake consensus |
+| **Extensible four ways** | built-in tools, drop-in Python plugins, `SKILL.md` skill packs, and any MCP server — plus agentd itself is an MCP server |
 | **Costs you less** | stable prompt prefix for provider-side caching, observation compaction, a per-step token ledger you can reconcile against your bill, cheap/strong tier routing |
 | **Recurring work** | dependency-free cron evaluator (`agentd schedule`), with one-shot catch-up after downtime |
-| **Shareable experience** | `agentd memory export` writes a signed `.agentdmem` pack **and** human-readable Markdown; import is idempotent and warns when provenance differs |
+| **Shareable experience** | `agentd memory export` writes a signed `.agentdmem` pack and human-readable Markdown; import is idempotent and warns when provenance differs |
 
-## Run it
+## Using it
 
-### 1. Point it at any model — three decode tiers
+### 1. Any model — three decode tiers
 
-JitRL needs a score per candidate action. Not every endpoint gives one, so `agentd` probes
-and degrades on purpose:
+The council and the agent loop both need a score per candidate action. Not every endpoint
+provides what scoring needs, so agentd probes the endpoint first and steps down
+automatically:
 
 | tier | endpoint gives | how the score is obtained |
 |---|---|---|
-| `token` | `logprobs` + `top_logprobs` | exactly the paper: `z = exp(logprob)` at the decision token |
+| `token` | `logprobs` + `top_logprobs` | the probability of the decision token, exactly as in the paper's formula (see [How it works](#how-it-works)) |
 | `n_sample` | logprob of the sampled token only | k independent samples; frequency becomes the score |
 | `verbalized` | nothing | the model grades each option 0–100 |
 
@@ -131,11 +94,14 @@ agentd probe --base-url http://127.0.0.1:8080/v1 --model qwen3-8b
 # → { "reachable": true, "decode_mode": "token", "notes": "top_logprobs at decision position …" }
 ```
 
-The reference implementation reads `logprobs.content[-2]`, which breaks the moment a chat
-template emits a different number of trailing tokens (reasoning models do). Here the
-decision position is *found*, not assumed — that is what makes "swap the model" safe.
+The reference implementation reads a fixed token position (`logprobs.content[-2]`). If a
+chat template emits a different number of trailing tokens — reasoning models do — that
+position goes wrong. agentd locates the decision token every time, which is what makes
+swapping models safe.
 
-### 2. Put it to work on a server
+### 2. Hand it a server
+
+Register a host, probe it, and route everything through one SSH tunnel:
 
 ```bash
 agentd host add --label prod-1 --host 10.0.0.5 --user ops --key ~/.ssh/id_ed25519
@@ -144,8 +110,8 @@ agentd viewer install                   # Xvfb + x11vnc + noVNC, loopback-only
 agentd serve                            # HTTP API + SSE on 127.0.0.1:8765
 ```
 
-Everything — API, PTY WebSocket, screen — travels through one SSH tunnel; the server exposes
-no public ports besides 22:
+API, PTY WebSocket and screen all travel through this one tunnel. The server exposes no
+public ports besides 22:
 
 ```bash
 ssh -N -L 8765:127.0.0.1:8765 -L 8766:127.0.0.1:8765 -L 6080:127.0.0.1:6080 root@your-server
@@ -155,8 +121,8 @@ ssh -N -L 8765:127.0.0.1:8765 -L 8766:127.0.0.1:8765 -L 6080:127.0.0.1:6080 root
 
 ### 3. The council: who sits at the table is yours
 
-Seats are not pinned to any vendor. Add an OpenAI-compatible endpoint, or a native
-Anthropic / Gemini seat, from the console's seats page or:
+One model makes mistakes. Several models that draft, then challenge each other, make fewer.
+Seats are not pinned to any vendor:
 
 ```bash
 curl -X POST http://127.0.0.1:8765/api/providers -H "Authorization: Bearer $TOKEN" \
@@ -174,36 +140,41 @@ POST /api/session
 
 ![Seats management](docs/images/console-seats.png)
 
-What the council does, concretely:
+The rules of the table:
 
 * **Independent proposals first.** Every member scores the candidate actions on its own.
-* **Cross-examination inside a boundary.** Members may only *flag problems* with someone
+* **Cross-examination inside a boundary.** Members may only flag problems with someone
   else's proposal — never rewrite the plan. The critique phase sees prior output as
   untrusted input and cannot change tool permissions.
-* **Learned trust.** Each member's weight is its historical win rate *in states like this
-  one*, so the council discovers that model A is right about nginx and model B is right
-  about gitlab, instead of trusting the same vendor forever.
+* **Learned trust.** Each member's weight is its historical win rate in states like this
+  one. The council discovers that model A is right about nginx and model B is right about
+  gitlab, instead of trusting the same vendor forever.
 * **Dissent is kept.** Objections become risk rows (`object` / `split` / `unavailable`) and
   render as their own block. A seat whose key is missing abstains with a recorded reason;
   the outcome is visibly thinner, never quietly wrong.
 * **Conditional by default.** Deliberation fires on a thin margin between the top two
-  options, a dangerous action, or a task you pin — confident steps cost one call.
+  options, a dangerous action, or a task you pin. Confident steps cost one call.
 
-### 4. Desktop client & console
+### 4. Console & desktop client
 
 ![Onboarding: tunnel, token, pick where to start](docs/images/console-onboarding.png)
 
-Two independent clients, one server. The browser console is a single no-build
-bundle served by agentd itself at `/`: you open it in a browser over the SSH
-tunnel. The desktop shell (Tauri, in the companion repo) is a separate
-implementation and does **not** load this bundle — no UI code is shared between
-them today. The shell's job is to open and supervise the SSH tunnel and add
-tray presence. Builds: macOS universal (Intel + Apple Silicon) and
-Windows (via GitHub Actions — Tauri cannot cross-compile a Windows bundle from a Mac).
+There are two clients, and they are independent:
+
+* **The browser console**: a single no-build bundle served by agentd itself at `/`. Open it
+  in a browser over the SSH tunnel.
+* **The desktop client** (Tauri, in the companion repo): a separate implementation that does
+  not load this bundle — no UI code is shared between them today. It opens and supervises
+  the SSH tunnel and adds tray presence.
+
+Desktop builds: macOS universal (Intel + Apple Silicon) and Windows. Windows builds run via
+GitHub Actions — Tauri cannot cross-compile a Windows bundle from a Mac.
 
 → **[hue913/council-agent](https://github.com/hue913/council-agent)**
 
 ### 5. Recurring work
+
+Let the agent work on a schedule, with one automatic catch-up run after downtime:
 
 ```bash
 agentd schedule add --name nightly-ops --cron "17 3 * * *" --task nginx-down
@@ -211,7 +182,89 @@ agentd schedule daemon
 agentd run --suite web --policy model          # measure with your real endpoint
 ```
 
+## Measured results
+
+Every number below reproduces on your own laptop. Bench output labels which policy produced
+the numbers, so the baseline and a real model never get mixed up.
+
+| suite | policy | scale | memory OFF | memory ON | delta |
+|---|---|---|---|---|---|
+| ops (scripted chains) | synthetic noisy model | 40 eps × 12 seeds | mean 1.1/40 | mean 14.4/40 | better in 11/12 seeds |
+| ops, default seed | same | 40 eps | 1/40 (2.5%) | 11/40 (27.5%) | 2nd half 55% |
+| web (real Chromium) | lexical baseline (not an LLM) | 60 eps × 3 seeds | mean 18.7/60 | mean 23.7/60 | **+0.08, one seed negative** |
+
+Reproduce the ops suite seed by seed:
+
+```bash
+for s in $(seq 1 12); do agentd bench --episodes 40 --seed $s | sed -n 3,4p; done
+```
+
+Three notes for reading the tables:
+
+* The ops suite varies a lot across seeds (0 to 30). Read the trend: learning is better in
+  11 of 12 seeds, and the twelfth is a tie where neither arm ever succeeds.
+* The web suite drives actual Chromium through Playwright over six MiniWoB-shaped tasks
+  (numbered elements, one goal, reward decided by a DOM checker on the page). Its gains are
+  modest and seed-dependent; why, see [Honest limits](#honest-limits).
+* Cross-machine reproducibility: a 2 vCPU Xeon deployment server (Ubuntu) reproduces the
+  laptop's seed-7 numbers exactly (1/40 vs 11/40). The measurement is seed-deterministic,
+  not machine-dependent.
+
+**Deliberately not measured here:** full WebArena. The official shape is 4 vCPU / 16 GB /
+1000 GB + 7 self-hosted sites; this project's reference box is a 2 GB VPS, so the web suite
+above is the MiniWoB-shaped compromise. `agentd host probe` tells you in one command whether
+your box could host the real thing.
+
+Also from the live box (the exact deploy walkthrough is in [`docs/DEPLOY.md`](docs/DEPLOY.md)):
+
+![The agent's view of the server screen](docs/images/server-screen.jpg)
+
+*The screen panel's capture path, unedited: Xvfb → x11vnc → agentd → JPEG, fetched through
+the tunnel. What the model sees is what you see here.*
+
 ## How it works
+
+### Why "without training" is the point
+
+Deployed LLM weights are frozen, so the same mistakes repeat forever. Conventional RL fixes
+that, but it costs two things a small box cannot pay: compute, and room for catastrophic
+forgetting.
+
+[**JitRL** (Just-In-Time Reinforcement Learning, arXiv:2601.18510)](https://arxiv.org/abs/2601.18510)
+moves the RL to inference time: a dynamic, non-parametric memory of `<state, action, reward>`
+triplets, retrieval of similar past trajectories, an on-the-fly advantage estimate, and a
+direct additive modulation of the output logits. The paper proves this additive update is
+the exact closed-form solution to the KL-constrained policy objective. On WebArena it beats
+the strongest fine-tuning baseline (WebRL) without any training, at a thirtieth of the cost.
+
+The core formula is one line:
+
+```
+z'(s,a) = z(s,a) + β·Â(s,a)
+```
+
+The model's own next-token score is z. agentd retrieves similar past situations, computes
+the **advantage** Â for each option — how much that option tended to earn in situations like
+this one — and adds it to z with a coefficient β. That is the whole learning: one table
+lookup and one addition. No gradients, no fine-tuning.
+
+The loop: `observe → enumerate/propose candidates → models score → kernel retrieves history
+and biases → argmax → execute via the tool bus → record (state, action, return) → reflect`.
+
+The end of each episode is Reflexion-shaped: the agent writes itself a two-sentence critique
+tied to specific actions, stores it, and recalls it the next time a similar situation
+appears.
+
+### Where this implementation differs from the paper's
+
+agentd is an independent, productised implementation of the JitRL idea, built for operators.
+Where it deviates from the reference implementation:
+
+* Retrieval is lexical: Jaccard n-grams over an inverted index, zero embedding calls. The
+  paper uses a full BM25 + embedding + LLM-scored stack; this is a deliberate cheap subset,
+  labelled as such.
+* The advantage and exploration terms follow the published equations, including the
+  "recompute-baseline" detail and the fixed ε=0.05 the published path actually uses.
 
 ```mermaid
 flowchart LR
@@ -244,9 +297,6 @@ flowchart LR
     classDef p fill:#eef,stroke:#88a;
 ```
 
-The loop: `observe → enumerate/propose candidates → models score → kernel retrieves history
-and biases → argmax → execute via the tool bus → record (state, action, return) → reflect`.
-
 Repo map:
 
 ```
@@ -265,34 +315,6 @@ ui/            the console, served same-origin by agentd
 tests/         ~300 tests; platform-specific ones skip with a stated reason
 ```
 
-## Measured, honestly
-
-Everything below is reproducible on a laptop; numbers are printed by the commands that
-produce them, not typed into a README by hand.
-
-| suite | policy | scale | memory OFF | memory ON | delta |
-|---|---|---|---|---|---|
-| ops (scripted chains) | synthetic noisy model | 40 eps × 12 seeds | mean 1.1/40 | mean 14.4/40 | better in 11/12 seeds |
-| ops, default seed | same | 40 eps | 1/40 (2.5%) | 11/40 (27.5%) | 2nd half 55% |
-| web (real Chromium) | lexical baseline (not an LLM) | 60 eps × 3 seeds | mean 18.7/60 | mean 23.7/60 | **+0.08, one seed negative** |
-
-Cross-machine reproducibility: the deployment server (2 vCPU Xeon, Ubuntu) reproduces the
-laptop's seed-7 numbers exactly (1/40 vs 11/40) — the measurement is seed-deterministic, not
-machine-dependent.
-
-**What is deliberately not measured here:** full WebArena. The official shape is 4 vCPU /
-16 GB / 1000 GB + 7 self-hosted sites; this project's reference box is a 2 GB VPS, so the
-web suite above is the MiniWoB-shaped compromise and `agentd host probe` tells you in one
-command whether your box could host the real thing. Benchmarks you cannot run are worth
-less than numbers you can.
-
-Also from the live box (the exact deploy walkthrough is in [`docs/DEPLOY.md`](docs/DEPLOY.md)):
-
-![The agent's view of the server screen](docs/images/server-screen.jpg)
-
-*The screen panel's capture path, unedited: Xvfb → x11vnc → agentd → JPEG, fetched through
-the tunnel. What the model sees is what you see here.*
-
 ## Deploy to a small VPS
 
 ```bash
@@ -301,9 +323,9 @@ the tunnel. What the model sees is what you see here.*
 bash deploy/install_server.sh /path/to/agentd
 ```
 
-The unit runs `agentd serve --host 127.0.0.1`, drops `AGENTD_AUTO_APPROVE` from the
-environment on purpose (the lab-only auto-approve switch can never reach a deployed
-service), and caps memory. The full worked example — including the mistake (a briefly
+The unit runs `agentd serve --host 127.0.0.1` and caps memory. It also drops
+`AGENTD_AUTO_APPROVE` from the environment on purpose: the lab-only auto-approve switch can
+never reach a deployed service. The full worked example — including the mistake (a briefly
 public noVNC port, and the status check that now fails loudly instead of staying quiet) —
 is in [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
@@ -320,8 +342,9 @@ cp -r examples/skills/nginx-triage ~/.config/agentd/skills/
 agentd mcp
 ```
 
-Config lives in one file (`agentd.json`, 0600) + environment variables; keys are referenced
-as `api_key_env` so they live in your systemd environment, not in the repo or the UI.
+Config lives in one file (`agentd.json`, 0600) plus environment variables. Keys are
+referenced as `api_key_env`, so they stay in your systemd environment — not in the repo,
+not in the browser.
 
 ## Security model, stated plainly
 
@@ -329,10 +352,10 @@ as `api_key_env` so they live in your systemd environment, not in the repo or th
   explicit `AGENTD_ALLOW_PUBLIC=1`. Remote reach is one `ssh -N -L`.
 * **Fail-closed auth.** Protected routes require a bearer token; with no token configured
   they answer 503, not "open".
-* **The gate decides, not the model.** Commands are classified *before* execution;
-  destructive intents need a human click that a disconnected socket can never auto-answer.
+* **The gate decides, not the model.** Commands are classified before execution.
+  Destructive intents need a human click that a disconnected socket can never auto-answer.
 * **Audit without secrets.** The PTY records a rolling digest of what was typed — never the
-  raw bytes — because an append-only log is exactly where secrets would end up.
+  raw bytes. An append-only log is exactly where secrets would end up.
 * **Honest failure everywhere.** Unreachable endpoint, missing key, refused command,
   blocked approval: each is rendered as itself. Nothing in this project fabricates a
   success.
@@ -341,11 +364,13 @@ as `api_key_env` so they live in your systemd environment, not in the repo or th
 
 * The council's trust weights need a few hundred episodes before they mean anything; early
   runs are deliberately neutral (0.5).
-* The lexical retrieval is weaker than the paper's embedded retriever on large memories —
-  it is fast, free and dependency-zero, and it is labelled as a subset.
-* The web-suite gains are small (see the table). If you need benchmark-grade numbers, run
-  `--policy model` with your own endpoint on real WebArena hardware.
-* One agent, one box: there is no cluster mode, and `agentd` does not pretend to be a
+* Lexical retrieval is weaker than the paper's embedded retriever on large memories. It is
+  fast, free, dependency-zero, and labelled as a subset.
+* The web-suite gains are small (see the table in [Measured results](#measured-results)).
+  Why: the advantage term can only amplify successes the base policy occasionally reaches,
+  and three of the six tasks are beyond the lexical baseline entirely. For benchmark-grade
+  numbers, run `--policy model` with your own endpoint on real WebArena hardware.
+* One agent, one box. There is no cluster mode, and agentd does not pretend to be a
   general-purpose coding agent. It operates servers, deliberately.
 
 ## Acknowledgments
