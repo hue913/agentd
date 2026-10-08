@@ -19,8 +19,11 @@ from typing import Protocol
 from .context import ContextBuilder, Ledger
 from .council import Council
 from .kernel.jitrl import JitRLKernel
+from .log import get_logger
 from .providers.base import Provider, ProviderError
 from .toolbus.bus import CallContext, ToolBus
+
+log = get_logger("agentd.loop")
 
 PROPOSE_INSTRUCTION = (
     "List the {k} most plausible next actions for this state. "
@@ -169,8 +172,10 @@ class AgentLoop:
                 options = _parse_options(text)
                 if options:
                     return options, "model"
-            except Exception:
-                pass
+            except Exception as exc:
+                # Propose is an optimisation: enumeration falls back to the
+                # task's own list, but the failure must be visible somewhere.
+                log.debug("candidate proposal failed: %s: %s", type(exc).__name__, exc)
         return [], "none"
 
     # -- one step ---------------------------------------------------------
@@ -318,6 +323,7 @@ class AgentLoop:
             text, usage = self.provider.text(prompt)
             self.ledger.record(usage, {"phase": "reflect"})
         except Exception as exc:
+            log.debug("reflection failed: %s: %s", type(exc).__name__, exc)
             return f"reflection failed: {type(exc).__name__}"
         return (text or "").strip()[:600]
 
@@ -344,9 +350,9 @@ def _short(text: object) -> str:
 def _parse_options(text: str) -> list[str]:
     import json
 
-    from .providers.openai_compat import _balanced_objects
+    from .providers.jsonutil import balanced_objects
 
-    for obj in _balanced_objects(text or ""):
+    for obj in balanced_objects(text or ""):
         rows = obj.get("options")
         if isinstance(rows, list):
             return [str(r).strip() for r in rows if str(r).strip()][:8]

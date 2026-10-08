@@ -18,7 +18,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .kernel.jitrl import Decision, JitRLKernel
+from .log import get_logger
 from .providers.base import Choice, Provider, Usage
+
+log = get_logger("agentd.council")
 
 
 @dataclass
@@ -149,7 +152,11 @@ class Council:
                 continue
             try:
                 text, used = member.text(prompt)
-            except Exception:
+            except Exception as exc:
+                # An abstaining member thins the deliberation but must not end
+                # it; the abstention is still observable in the logs.
+                log.debug("critique from %s failed: %s: %s",
+                          member.label, type(exc).__name__, exc)
                 continue
             total = total + used
             for item in _objection_rows(text):
@@ -268,9 +275,9 @@ def _objection_rows(text: str) -> list[dict]:
     import json
     import re
 
-    from .providers.openai_compat import _balanced_objects
+    from .providers.jsonutil import balanced_objects
 
-    for obj in _balanced_objects(text or ""):
+    for obj in balanced_objects(text or ""):
         rows = obj.get("objections")
         if isinstance(rows, list):
             return [r for r in rows if isinstance(r, dict) and r.get("target_member") and r.get("stance")]

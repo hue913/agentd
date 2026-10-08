@@ -22,12 +22,10 @@ calibration problem rather than a correctness one.
 
 from __future__ import annotations
 
-import json
 import time
-import urllib.error
-import urllib.request
 
 from .base import Choice, DecodeMode, Provider, ProviderError, ScoreSpace, Usage
+from .http import ProviderHTTPStatus, post_json
 from .openai_compat import _parse_index, _parse_scores
 
 # VERBALIZED maps a self-reported 0-100 confidence onto this curve. It is the
@@ -78,24 +76,14 @@ class _NativeJSONProvider(Provider):
 
     def _post(self, body: dict, timeout: int | None = None) -> dict:
         url = (self.spec.base_url or self.default_base_url).rstrip("/") + self.endpoint_path
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", **self._headers()},
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.spec.timeout_s) as resp:
-                raw = resp.read().decode()
-        except urllib.error.HTTPError as exc:
+            return post_json(url, headers=self._headers(), payload=body,
+                             timeout=timeout or self.spec.timeout_s)
+        except ProviderHTTPStatus as exc:
             # Upstream bodies can echo the prompt or the key; never relay them.
             raise ProviderError(f"{self.label}: HTTP {exc.code} from endpoint") from exc
-        except Exception as exc:
+        except ProviderError as exc:
             raise ProviderError(f"{self.label}: {type(exc).__name__}: {exc}") from exc
-        try:
-            return json.loads(raw)
-        except ValueError as exc:
-            raise ProviderError(f"{self.label}: endpoint returned non-JSON") from exc
 
     # -- Provider contract -------------------------------------------------
     def choose(self, system: str, user: str, candidates: list[str]) -> Choice:

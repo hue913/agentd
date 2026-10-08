@@ -7,13 +7,12 @@ what "plug in any model" means here: base_url + api_key + model name.
 
 from __future__ import annotations
 
-import json
 import math
 import time
-import urllib.error
-import urllib.request
 
 from .base import Choice, DecodeMode, Provider, ProviderError, ScoreSpace, Usage
+from .http import post_json
+from .jsonutil import balanced_objects as _balanced_objects  # noqa: F401  (forwarding alias)
 
 _DIGITS = {str(i) for i in range(1, 100)}
 
@@ -29,23 +28,8 @@ def _digit_value(token: str) -> int | None:
 
 
 def _post(url: str, payload: dict, headers: dict, timeout: int, retries: int = 2) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    last: Exception | None = None
-    for attempt in range(retries + 1):
-        req = urllib.request.Request(url, data=body, headers={**headers, "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8", "ignore"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "ignore")[:400]
-            last = ProviderError(f"HTTP {exc.code} from {url}: {detail}")
-            if exc.code in (400, 401, 403, 404):
-                raise last from exc
-        except Exception as exc:  # timeouts, DNS, connection resets
-            last = exc
-        if attempt < retries:
-            time.sleep(1.5 * (attempt + 1))
-    raise ProviderError(f"request failed after {retries + 1} attempts: {last}")
+    """Backwards-compatible shim: the shared post_json owns retry/backoff now."""
+    return post_json(url, headers=headers, payload=payload, timeout=timeout, max_retries=retries)
 
 
 def extract_candidate_scores(logprobs_content: list[dict], n_candidates: int) -> dict[int, float] | None:
@@ -224,29 +208,6 @@ def _parse_index(text: str, n: int) -> int | None:
             if 1 <= value <= n:
                 return value
     return None
-
-
-def _balanced_objects(text: str) -> list[dict]:
-    """Return every top-level JSON object in the text (models rarely emit clean JSON)."""
-    out: list[dict] = []
-    depth, start = 0, -1
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    try:
-                        obj = json.loads(text[start : i + 1])
-                    except ValueError:
-                        obj = None
-                    if isinstance(obj, dict):
-                        out.append(obj)
-                    start = -1
-    return out
 
 
 def _coerce_scores(source: dict) -> dict[int, float]:

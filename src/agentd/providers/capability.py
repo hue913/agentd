@@ -3,17 +3,23 @@
 The probe is what makes "connect any model" honest instead of aspirational:
 one endpoint gives top_logprobs (JitRL as published), another only the sampled
 token's logprob (needs vote sampling), a third gives nothing (verbalised grading).
+
+The result is cached with a TTL: /api/state probes every configured provider on
+every poll, and one unreachable endpoint used to add its full timeout to each
+poll. Within the TTL the cached answer is returned with `cached: true` and no
+HTTP request is made.
 """
 
 from __future__ import annotations
 
-import json
+import dataclasses
+import hashlib
+import os
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 
 from .base import DecodeMode, ProviderSpec, ScoreSpace
+from .http import ProviderHTTPStatus, post_json
 
 PROBE_SYSTEM = "You answer with exactly one digit and nothing else."
 PROBE_USER = (
@@ -23,7 +29,11 @@ PROBE_USER = (
     "Answer with only 1 or 2."
 )
 
-_CACHE: dict[tuple[str, str], "Capabilities"] = {}
+# Override with AGENTD_STATE_PROBE_TTL (seconds); 0 disables caching.
+PROBE_TTL_S = int(os.environ.get("AGENTD_STATE_PROBE_TTL", "60") or "60")
+
+# (kind, base_url, model, label, api_key digest) -> (Capabilities, monotonic ts)
+_CACHE: dict[tuple, tuple["Capabilities", float]] = {}
 
 
 @dataclass
@@ -36,6 +46,7 @@ class Capabilities:
     mode: DecodeMode = DecodeMode.VERBALIZED
     notes: str = ""
     latency_ms: int = 0
+    cached: bool = False
     raw: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
@@ -44,7 +55,7 @@ class Capabilities:
             "supports_logprobs": self.supports_logprobs,
             "supports_top_logprobs": self.supports_top_logprobs,
             "decode_mode": self.mode.value, "notes": self.notes,
-            "latency_ms": self.latency_ms,
+            "latency_ms": self.latency_ms, "cached": self.cached,
         }
 
 
@@ -63,13 +74,33 @@ def _headers(spec: ProviderSpec) -> dict:
     return h
 
 
+def _cache_key(spec: ProviderSpec) -> tuple:
+    # The key must include the protocol AND the credentials: two specs can
+    # share a model name while speaking different wire formats or holding
+    # different keys, and a stale hit would report one endpoint's capabilities
+    # for the other's. The key is hashed, never stored in clear.
+    return (spec.kind, spec.base_url, spec.model, spec.label,
+            hashlib.sha256((spec.api_key or "").encode()).hexdigest()[:16])
+
+
+def _cached_copy(key: tuple) -> "Capabilities | None":
+    entry = _CACHE.get(key)
+    if entry is None:
+        return None
+    caps, probed_at = entry
+    if PROBE_TTL_S <= 0 or (time.monotonic() - probed_at) >= PROBE_TTL_S:
+        return None
+    # A copy, not the shared instance: callers mutate capabilities (forced
+    # decode modes) and a shared object would leak that between callers.
+    return dataclasses.replace(caps, cached=True)
+
+
 def probe_capabilities(spec: ProviderSpec, use_cache: bool = True, timeout: int = 30) -> Capabilities:
-    # The cache key must include the protocol. Two specs can share a model name
-    # while speaking different wire formats, and a stale hit would report one
-    # endpoint's capabilities for the other's.
-    key = (spec.kind, spec.base_url, spec.model)
-    if use_cache and key in _CACHE:
-        return _CACHE[key]
+    key = _cache_key(spec)
+    if use_cache:
+        hit = _cached_copy(key)
+        if hit is not None:
+            return hit
 
     if spec.kind != "openai_compat":
         # The probe below is an OpenAI-shaped request (logprobs + top_logprobs
@@ -80,7 +111,7 @@ def probe_capabilities(spec: ProviderSpec, use_cache: bool = True, timeout: int 
         caps = Capabilities(model=spec.model, label=spec.label)
         caps.decode_mode = DecodeMode.VERBALIZED
         caps.notes = f"kind={spec.kind}: native protocol exposes no logprobs; tier is fixed"
-        _CACHE[key] = caps
+        _CACHE[key] = (caps, time.monotonic())
         return caps
 
     caps = Capabilities(model=spec.model, label=spec.label)
@@ -97,11 +128,12 @@ def probe_capabilities(spec: ProviderSpec, use_cache: bool = True, timeout: int 
     }
     t0 = time.time()
     try:
-        req = urllib.request.Request(_url(spec), data=json.dumps(payload).encode(), headers=_headers(spec))
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "ignore"))
-    except urllib.error.HTTPError as exc:
-        caps.notes = f"HTTP {exc.code}: {exc.read().decode('utf-8', 'ignore')[:200]}"
+        # max_retries=0: this probe runs on every state poll, so a slow
+        # endpoint must not multiply its latency by a retry ladder.
+        data = post_json(_url(spec), headers=_headers(spec), payload=payload,
+                         timeout=timeout, max_retries=0)
+    except ProviderHTTPStatus as exc:
+        caps.notes = f"HTTP {exc.code}: {exc.detail[:200]}"
     except Exception as exc:
         caps.notes = f"{type(exc).__name__}: {exc}"
     else:
@@ -128,7 +160,7 @@ def probe_capabilities(spec: ProviderSpec, use_cache: bool = True, timeout: int 
     if spec.decode_mode:
         caps.mode = spec.decode_mode
         caps.notes += f" | forced by config -> {caps.mode.value}"
-    _CACHE[key] = caps
+    _CACHE[key] = (caps, time.monotonic())
     return caps
 
 
