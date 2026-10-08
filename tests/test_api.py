@@ -356,3 +356,19 @@ def test_ops_session_runs_and_fails_honestly_without_a_usable_model(server):
     assert report is not None
     assert report["status"] == "failed"
     assert "provider" in str(report["report"].get("stopped_by", ""))
+
+
+def test_ssh_exec_upstream_failure_does_not_leak_internals(server, monkeypatch):
+    """A crashed upstream exec returns a one-line 502; the traceback, exception
+    class and raw message stay on the server (stderr), not the client."""
+    base, rt = server
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("secret detail: /Users/mac/.config/agentd/agentd.json was here")
+
+    monkeypatch.setattr(rt.ssh, "exec", explode)
+    code, body = post(f"{base}/api/ssh/exec", {"host": "anyhost", "command": "ls"})
+    assert code == 502, body
+    text = json.dumps(body)
+    assert "secret detail" not in text
+    assert "RuntimeError" not in text

@@ -6,11 +6,13 @@ import asyncio
 import hmac
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 from . import ops
 from ..context import compact_observation
+from ..envs.ssh_env import SSHError
 from ..kernel.pack import diff_packs, export_pack, import_pack, load_pack, to_markdown
 from ..runtime import Runtime
 
@@ -218,8 +220,11 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
                 raw = json.loads(raw)
             except ValueError:
                 raise HTTPException(400, "pack must be a JSON object or JSON string")
-        report = import_pack(rt.store, raw, skip_tasks=body.get("skip_tasks", []),
-                             current_source={"providers": list(rt.providers)})
+        # import_pack commits per task/step: running it on the loop thread froze
+        # every other request for the whole import.
+        report = await asyncio.to_thread(
+            import_pack, rt.store, raw, skip_tasks=body.get("skip_tasks", []),
+            current_source={"providers": list(rt.providers)})
         return report
 
     @app.get("/api/memory/diff")
@@ -246,12 +251,19 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
         from ..envs.ssh_env import ApprovalRequired
 
         try:
-            result = rt.ssh.exec(host, command, approved=bool(body.get("approved")),
-                                 session=body.get("session"))
+            # subprocess under the hood (up to 60s): must leave the event loop.
+            result = await asyncio.to_thread(
+                rt.ssh.exec, host, command, approved=bool(body.get("approved")),
+                session=body.get("session"))
         except ApprovalRequired as exc:
             return JSONResponse({"blocked": True, "reason": str(exc)}, status_code=202)
+        except SSHError as exc:
+            # Typed hub errors are short, operator-facing facts (unknown host,
+            # auth refused) and safe to echo verbatim.
+            raise HTTPException(502, str(exc))
         except Exception as exc:
-            raise HTTPException(502, f"{type(exc).__name__}: {exc}")
+            _report_upstream("ssh.exec", exc)
+            raise HTTPException(502, "upstream ssh command failed")
         return result.as_dict()
 
     @app.post("/api/ssh/probe")
@@ -260,9 +272,12 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
         if not host:
             raise HTTPException(400, "body needs 'host'")
         try:
-            return rt.ssh.probe(host)
-        except Exception as exc:
+            return await asyncio.to_thread(rt.ssh.probe, host)
+        except SSHError as exc:
             raise HTTPException(502, str(exc))
+        except Exception as exc:
+            _report_upstream("ssh.probe", exc)
+            raise HTTPException(502, "upstream ssh probe failed")
 
     @app.post("/api/util/compact")
     async def compact(body: dict):
@@ -328,6 +343,16 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
 
 
     return app
+
+
+def _report_upstream(what: str, exc: Exception) -> None:
+    """Client gets a one-liner; the full exception stays on the server.
+
+    Exception class names and raw messages have carried internal paths and
+    config fragments to clients before; they belong in server observability.
+    TODO(P2): replace the stderr print with the unified logging channel.
+    """
+    print(f"agentd: {what} upstream failure: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 _PLACEHOLDER_PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>agentd</title>
