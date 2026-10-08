@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from .credit import credit_factor, migrate
 
+import functools
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -59,8 +61,24 @@ CREATE TABLE IF NOT EXISTS risks (
     severity    TEXT,
     detail      TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_episodes_task  ON episodes(task);
+CREATE INDEX IF NOT EXISTS idx_risks_episode  ON risks(episode_id);
 PRAGMA journal_mode=WAL;
 """
+
+# One public Store method = one transaction. The class holds a single SQLite
+# connection created with check_same_thread=False because FastAPI thread-pool
+# workers, asyncio.to_thread workers and the scheduler all touch it; SQLite
+# connections are not thread-safe, and without serialisation two threads can
+# interleave statements inside one transaction (sqlite3 only catches misuse
+# when check_same_thread is left on). The store is small enough that an RLock
+# costs nothing and is far easier to reason about than per-thread connections.
+def _transaction(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -104,11 +122,17 @@ class Episode:
 
 class Store:
     def __init__(self, path: str | Path = ":memory:"):
+        self._lock = threading.RLock()
         path = str(path)
         if path != ":memory:":
             Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # Enforce the episode_id foreign keys. This is a connection-level
+        # pragma and a no-op inside a transaction, so it runs before the
+        # schema script. Existing rows written before enforcement are never
+        # re-validated by SQLite, so opening an old database stays safe.
+        self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(_SCHEMA)
         migrate(self.db)
         self.db.commit()
@@ -117,10 +141,12 @@ class Store:
         # which ids changed so they can refresh only those rows.
         self._mutated_steps: list[int] = []
 
+    @_transaction
     def close(self) -> None:
         self.db.close()
 
     # -- episodes ---------------------------------------------------------
+    @_transaction
     def start_episode(self, task: str, goal: str = "", meta: dict | None = None) -> int:
         cur = self.db.execute(
             "INSERT INTO episodes(task, goal, started_at, meta) VALUES(?,?,?,?)",
@@ -129,6 +155,7 @@ class Store:
         self.db.commit()
         return int(cur.lastrowid)
 
+    @_transaction
     def finish_episode(
         self,
         episode_id: int,
@@ -142,6 +169,7 @@ class Store:
         )
         self.db.commit()
 
+    @_transaction
     def get_episode(self, episode_id: int) -> Episode | None:
         row = self.db.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
         if row is None:
@@ -154,6 +182,7 @@ class Store:
             meta=json.loads(row["meta"] or "{}"),
         )
 
+    @_transaction
     def recent_analyses(self, task: str | None = None, limit: int = 3) -> list[str]:
         if task:
             rows = self.db.execute(
@@ -169,6 +198,7 @@ class Store:
         return [r["analysis"] for r in rows]
 
     # -- steps ------------------------------------------------------------
+    @_transaction
     def add_step(self, step: Step) -> int:
         cur = self.db.execute(
             "INSERT INTO steps(episode_id, t, state, state_fp, action, action_fp, scope,"
@@ -182,13 +212,16 @@ class Store:
         self.db.commit()
         return int(cur.lastrowid)
 
+    @_transaction
     def set_step_outcome(self, step_id: int, reward: float, ret: float) -> None:
         self.db.execute("UPDATE steps SET reward=?, ret=? WHERE id=?", (reward, ret), step_id)
         self.db.commit()
 
+    @_transaction
     def all_steps(self) -> list[Step]:
         return [Step(**dict(r)) for r in self.db.execute("SELECT * FROM steps ORDER BY id")]
 
+    @_transaction
     def steps_after(self, step_id: int) -> list[Step]:
         """Steps with id > step_id, ascending — the delta feed the retrieval
         index consumes so a growing memory never triggers a full rebuild."""
@@ -197,26 +230,32 @@ class Store:
             for r in self.db.execute("SELECT * FROM steps WHERE id > ? ORDER BY id", (step_id,))
         ]
 
+    @_transaction
     def steps_for_episode(self, episode_id: int) -> list[Step]:
         return [
             Step(**dict(r))
             for r in self.db.execute("SELECT * FROM steps WHERE episode_id=? ORDER BY t", (episode_id,))
         ]
 
+    @_transaction
     def count_steps(self) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM steps").fetchone()[0])
 
+    @_transaction
     def max_step_id(self) -> int:
         return int(self.db.execute("SELECT COALESCE(MAX(id), 0) FROM steps").fetchone()[0])
 
+    @_transaction
     def count_episodes(self) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM episodes").fetchone()[0])
 
+    @_transaction
     def delete_episode(self, episode_id: int) -> None:
         self.db.execute("DELETE FROM steps WHERE episode_id=?", (episode_id,))
         self.db.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
         self.db.commit()
 
+    @_transaction
     def wipe(self) -> None:
         """Drop all learned experience (used by the --memory off control arm)."""
         self.db.execute("DELETE FROM steps")
@@ -226,6 +265,7 @@ class Store:
         self.db.commit()
 
     # -- council: per-member reliability ----------------------------------
+    @_transaction
     def record_member_outcome(self, member: str, scope: str, won: bool, ret: float = 0.0) -> None:
         self.db.execute(
             "INSERT INTO model_stats(member, scope, trials, wins, ret_sum) VALUES(?,?,1,?,?) "
@@ -235,6 +275,7 @@ class Store:
         )
         self.db.commit()
 
+    @_transaction
     def member_reliability(self, scope: str = "") -> dict[str, float]:
         """Add-one smoothed win rate per member, globally pooled with scope preference.
 
@@ -252,6 +293,7 @@ class Store:
             out[row["member"]] = (wins + 1) / (trials + 2)
         return out
 
+    @_transaction
     def add_risk(self, episode_id: int | None, member: str, description: str,
                  severity: str = "medium", detail: str = "") -> None:
         self.db.execute(
@@ -260,6 +302,7 @@ class Store:
         )
         self.db.commit()
 
+    @_transaction
     def risks_for(self, episode_id: int | None = None, limit: int = 50) -> list[dict]:
         if episode_id is None:
             rows = self.db.execute("SELECT * FROM risks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
@@ -270,6 +313,7 @@ class Store:
         return [dict(r) for r in rows]
 
     # -- credit accounting ------------------------------------------------
+    @_transaction
     def note_recall(self, step_ids: list[int]) -> None:
         """Record that these experiences were surfaced to the kernel."""
         ids = [int(i) for i in step_ids if i]
@@ -280,13 +324,21 @@ class Store:
         self.db.commit()
         self._mutated_steps.extend(ids)
 
+    @_transaction
     def note_outcome(self, step_id: int, adopted: bool) -> None:
         """Record whether the decision that followed agreed with this step."""
-        column = "adopted" if adopted else "rejected"
-        self.db.execute(f"UPDATE steps SET {column} = {column} + 1 WHERE id = ?", (int(step_id),))
+        step_id = int(step_id)
+        # Static SQL branches instead of an f-string column name: the column
+        # is never data, and a stable statement is both safer and kinder to
+        # the query planner's statement cache.
+        if adopted:
+            self.db.execute("UPDATE steps SET adopted = adopted + 1 WHERE id = ?", (step_id,))
+        else:
+            self.db.execute("UPDATE steps SET rejected = rejected + 1 WHERE id = ?", (step_id,))
         self.db.commit()
-        self._mutated_steps.append(int(step_id))
+        self._mutated_steps.append(step_id)
 
+    @_transaction
     def steps_by_ids(self, step_ids: list[int]) -> list[Step]:
         """Re-read specific steps — the delta refresh for index snapshots."""
         if not step_ids:
@@ -295,6 +347,7 @@ class Store:
         return [Step(**dict(r)) for r in
                 self.db.execute(f"SELECT * FROM steps WHERE id IN ({marks})", step_ids)]
 
+    @_transaction
     def mutated_steps_since(self, seq: int) -> tuple[list[int], int]:
         """Ids of steps mutated in place since `seq`, plus the new sequence number.
 
@@ -304,6 +357,7 @@ class Store:
         """
         return self._mutated_steps[seq:], len(self._mutated_steps)
 
+    @_transaction
     def credit_report(self, limit: int = 50) -> list[dict]:
         """Per-memory credit, most-decided first. Feeds /api/credit."""
         rows = self.db.execute(
@@ -323,6 +377,7 @@ class Store:
             })
         return out
 
+    @_transaction
     def credit_totals(self) -> dict:
         row = self.db.execute(
             "SELECT COUNT(*) AS steps, "
