@@ -200,5 +200,9 @@ class ScreenActions:
 
             self.audit.write(AuditRecord(host=f"display{self.display}", command=command,
                                          level=level, reasons=reasons, error=error))
-        except Exception:
-            pass  # never let auditing break input injection
+        except Exception as exc:
+            # Never let auditing break input injection — but say why the
+            # record is missing instead of failing silently.
+            from ..log import get_logger
+
+            get_logger("agentd.screen").warning("screen audit write failed: %s", exc)

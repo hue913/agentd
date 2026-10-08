@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 import threading
 import time
 import uuid
@@ -18,6 +17,7 @@ from .council import Council, TriggerPolicy
 from .envs.ops_tasks import BUILTIN_TASKS
 from .envs.ssh_env import HostSpec, SSHHub
 from .kernel import JitRLKernel, Store
+from .log import get_logger
 from .loop import AgentLoop, LoopConfig
 from .providers import (
     NATIVE_PROVIDERS,
@@ -29,6 +29,8 @@ from .providers import (
 from .safety.audit import AuditLog
 from .toolbus import ToolBus, load_plugin_dir, load_skill_dir, register_builtins, register_mcp_server
 from .toolbus.mcp_client import MCPServerStdio
+
+log = get_logger("agentd.runtime")
 
 
 @dataclass
@@ -79,8 +81,11 @@ class Runtime:
         from .envs.pty_env import PTYHub
 
         # Interactive shells are a separate capability from batch exec, with
-        # their own admission check and their own reaper.
+        # their own admission check and their own reaper. The reaper runs in
+        # the background so dead shells are collected even if nobody opens
+        # the PTY panel; close() stops it.
         self.pty = PTYHub(self.ssh, audit=self.audit)
+        self.pty.start_reaper()
         # One ScreenCapture for the process: change detection is stateful, and a
         # per-request capture would never see its own previous frame.
         from .screen import Perceiver, ScreenActions, ScreenCapture
@@ -456,9 +461,8 @@ class Runtime:
             # drop is indistinguishable from a bug — count it where state()
             # can report it.
             self.dropped_events += 1
-            # TODO(P2): route through the unified logging channel instead of stderr.
-            print(f"agentd: subscriber queue full, event dropped "
-                  f"(total dropped: {self.dropped_events})", file=sys.stderr)
+            log.warning("subscriber queue full, event dropped (total dropped: %d)",
+                        self.dropped_events)
 
     def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=512)
@@ -501,6 +505,7 @@ class Runtime:
         }
 
     def close(self) -> None:
+        self.pty.stop_reaper()
         for server in self._mcp_servers.values():
             server.stop()
         self.ssh.close()

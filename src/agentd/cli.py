@@ -214,7 +214,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     runtime = Runtime(load_config(args.config))
     from .api import create_app
+    from .log import install_uvicorn_filters
 
+    # Access logs carry `?token=...` for the SSE/WebSocket transports; redact
+    # before uvicorn starts so no API token lands in journald verbatim.
+    install_uvicorn_filters()
     app = create_app(runtime)
     print(f"agentd api  http://{args.host}:{args.port}  (loopback only)")
     print(f"memory      {runtime.db_path}")
