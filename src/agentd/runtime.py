@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,7 +38,6 @@ class Session:
     loop: AgentLoop
     status: str = "queued"
     report: dict | None = None
-    events: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     pending_approvals: dict = field(default_factory=dict)
     task_obj: object | None = None      # the environment this session runs
@@ -49,8 +51,26 @@ class Runtime:
         self.audit = AuditLog(Path(self.db_path).parent / "audit.jsonl")
         self.bus = ToolBus()
         register_builtins(self.bus)
-        self.sessions: dict[str, Session] = {}
+        # OrderedDict so eviction is oldest-first; sessions only ever grow in a
+        # long-lived process otherwise.
+        self.sessions: OrderedDict[str, Session] = OrderedDict()
+        self.max_sessions = int(self.config.get("max_sessions", 200))
+        self.session_ttl_s = int(self.config.get("session_ttl_s", 6 * 3600))
+        # Every approval request registers here, keyed by token, so it is
+        # resolvable no matter which thread asked. Session copies are only the
+        # per-session UI view; without this table an approval raised outside a
+        # session worker (e.g. the HTTP ssh.exec route) would hang unresolvable.
+        self.pending_approvals: dict[str, dict] = {}
         self.subscribers: list[asyncio.Queue] = []
+        self._subscribers_lock = threading.Lock()
+        # Captured on the first subscribe (which happens on the server's event
+        # loop). Worker threads publish through it; see publish().
+        self.main_loop: asyncio.AbstractEventLoop | None = None
+        self.dropped_events = 0
+        # The session whose agent loop is running *on this thread* — approvals
+        # and other context lookups must follow the calling thread, not a
+        # process-wide "current" pointer that concurrent sessions overwrite.
+        self._local = threading.local()
         self._mcp_servers: dict[str, MCPServerStdio] = {}
         from .viewer import TokenVault
 
@@ -198,8 +218,7 @@ class Runtime:
         try:
             caps = probe_capabilities(provider.spec, timeout=10).as_dict()
         except Exception as exc:
-            return {"name": name, "reachable": False,
-                    "notes": f"{type(exc).__name__}: {exc}"[:300]}
+            return {"name": name, "reachable": False, "notes": _short_reason(exc)}
         return {"name": name, **caps}
 
     def reload_providers(self) -> None:
@@ -253,37 +272,48 @@ class Runtime:
 
     # -- approvals --------------------------------------------------------
     def _ask_human(self, payload: dict) -> bool:
-        """Blocking approval request surfaced to connected clients."""
+        """Blocking approval request surfaced to connected clients.
+
+        Sessions run on `asyncio.to_thread` worker threads, so there is no
+        running event loop here — the previous asyncio.Queue waiter raised
+        RuntimeError on every call and silently denied all pending commands.
+        A threading.Event is safe to wait on from the worker thread and to set
+        from the HTTP handler thread; the event loop never blocks.
+        """
         if os.environ.get("AGENTD_AUTO_APPROVE") == "1":
             self.publish({"type": "approval", "auto": True, **payload})
             return True
         token = uuid.uuid4().hex[:12]
-        waiter: asyncio.Queue = asyncio.Queue()
-        record = {"token": token, "payload": payload, "waiter": waiter, "decided": None}
+        record = {"token": token, "payload": payload,
+                  "event": threading.Event(), "decided": None}
+        self.pending_approvals[token] = record
         session = self._current_session()
         if session:
             session.pending_approvals[token] = record
         self.publish({"type": "approval_required", "token": token, **payload})
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return False
-        return _wait_blocking(loop, waiter, timeout=int(os.environ.get("AGENTD_APPROVAL_TIMEOUT", "300")))
+        timeout = float(os.environ.get("AGENTD_APPROVAL_TIMEOUT", "300"))
+        record["event"].wait(timeout)
+        # Remove the record whichever way it ends: a timeout must not leave a
+        # phantom approval card, and a resolved one no longer needs a slot.
+        self.pending_approvals.pop(token, None)
+        if session:
+            session.pending_approvals.pop(token, None)
+        return record["decided"] is True
 
     def resolve_approval(self, token: str, approved: bool) -> bool:
+        record = self.pending_approvals.get(token)
+        if record is None:
+            return False
+        record["decided"] = approved
+        record["event"].set()
+        self.publish({"type": "approval_resolved", "token": token, "approved": approved})
+        self.pending_approvals.pop(token, None)
         for session in self.sessions.values():
-            record = session.pending_approvals.get(token)
-            if record:
-                record["waiter"].put_nowait(approved)
-                record["decided"] = approved
-                self.publish({"type": "approval_resolved", "token": token, "approved": approved})
-                return True
-        return False
-
-    _current = None
+            session.pending_approvals.pop(token, None)
+        return True
 
     def _current_session(self):
-        return self._current
+        return getattr(self._local, "session", None)
 
     # -- sessions ---------------------------------------------------------
     def build_task(self, task_name: str, *, kind: str = "task", host: str = ""):
@@ -358,12 +388,31 @@ class Runtime:
         session = Session(id=uuid.uuid4().hex[:10], task=task_name, loop=loop,
                           task_obj=task_obj)
         self.sessions[session.id] = session
+        self._prune_sessions()
         return session
 
-    def run_session(self, session: Session) -> dict:
-        import threading
+    def _prune_sessions(self) -> None:
+        """Evict finished sessions past the TTL, then oldest-finished overage.
 
-        self._current = session
+        Queued/running sessions are never evicted: dropping one would orphan a
+        live episode. If every slot is busy the dict grows past the cap instead
+        of killing work.
+        """
+        now = time.time()
+        for sid in [sid for sid, s in self.sessions.items()
+                    if s.status not in ("queued", "running")
+                    and now - s.created_at > self.session_ttl_s]:
+            del self.sessions[sid]
+        while len(self.sessions) > self.max_sessions:
+            for sid, s in self.sessions.items():
+                if s.status not in ("queued", "running"):
+                    del self.sessions[sid]
+                    break
+            else:
+                break
+
+    def run_session(self, session: Session) -> dict:
+        self._local.session = session
         session.status = "running"
         self.publish({"type": "session_started", "session": session.id, "task": session.task})
         try:
@@ -373,29 +422,59 @@ class Runtime:
             session.status = "success" if report.success else "failed"
         except Exception as exc:
             session.status = "error"
-            session.report = {"error": f"{type(exc).__name__}: {exc}"}
-            self.publish({"type": "session_error", "session": session.id, "error": str(exc)})
-        self._current = None
+            session.report = {"error": _short_reason(exc)}
+            self.publish({"type": "session_error", "session": session.id, "error": _short_reason(exc)})
+        finally:
+            self._local.session = None
         self.publish({"type": "session_finished", "session": session.id, "status": session.status,
                       "report": session.report})
         return session.report or {}
 
     def publish(self, event: dict) -> None:
         event["ts"] = time.time()
-        for queue in list(self.subscribers):
-            try:
-                queue.put_nowait(event)
-            except asyncio.QueueFull:
-                pass
+        loop = self.main_loop
+        with self._subscribers_lock:
+            subscribers = list(self.subscribers)
+        for queue in subscribers:
+            if loop is not None:
+                try:
+                    # asyncio.Queue.put_nowait is not safe against an awaiting
+                    # consumer on the loop thread; marshalling the put through
+                    # call_soon_threadsafe keeps it on the thread that owns the
+                    # queue. It is also safe when called from the loop itself.
+                    loop.call_soon_threadsafe(self._offer, queue, event)
+                    continue
+                except RuntimeError:
+                    pass    # loop closed mid-shutdown: fall back to a direct put
+            self._offer(queue, event)
+
+    def _offer(self, queue: asyncio.Queue, event: dict) -> None:
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # A slow subscriber must not stall the agent loop, but a silent
+            # drop is indistinguishable from a bug — count it where state()
+            # can report it.
+            self.dropped_events += 1
+            # TODO(P2): route through the unified logging channel instead of stderr.
+            print(f"agentd: subscriber queue full, event dropped "
+                  f"(total dropped: {self.dropped_events})", file=sys.stderr)
 
     def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=512)
-        self.subscribers.append(queue)
+        if self.main_loop is None:
+            try:
+                self.main_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass    # no loop (CLI/tests): direct puts are the only option anyway
+        with self._subscribers_lock:
+            self.subscribers.append(queue)
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
-        if queue in self.subscribers:
-            self.subscribers.remove(queue)
+        with self._subscribers_lock:
+            if queue in self.subscribers:
+                self.subscribers.remove(queue)
 
     # -- snapshot for the UI ---------------------------------------------
     def state(self) -> dict:
@@ -404,7 +483,7 @@ class Runtime:
             try:
                 caps[name] = probe_capabilities(provider.spec, timeout=8).as_dict()
             except Exception as exc:
-                caps[name] = {"label": name, "reachable": False, "notes": str(exc)[:200]}
+                caps[name] = {"label": name, "reachable": False, "notes": _short_reason(exc)}
         return {
             "providers": {name: {"model": p.spec.model, "base_url": p.spec.base_url, "tier": p.spec.tier}
                           for name, p in self.providers.items()},
@@ -415,6 +494,9 @@ class Runtime:
             "tasks": sorted(BUILTIN_TASKS),
             "extensions": self.extensions,
             "sessions": [{"id": s.id, "task": s.task, "status": s.status} for s in self.sessions.values()],
+            "session_count": len(self.sessions),
+            "max_sessions": self.max_sessions,
+            "events": {"subscribers": len(self.subscribers), "dropped": self.dropped_events},
             "db": self.db_path,
         }
 
@@ -424,19 +506,15 @@ class Runtime:
         self.ssh.close()
 
 
-def _wait_blocking(loop, waiter: asyncio.Queue, timeout: int) -> bool:
-    """Block the worker thread until a client resolves the approval (or it times out)."""
-    async def _wait():
-        try:
-            return await asyncio.wait_for(waiter.get(), timeout=timeout)
-        except (asyncio.TimeoutError, TimeoutError):
-            return False
+def _short_reason(exc: BaseException) -> str:
+    """One human-readable line for a client; full detail stays server-side.
 
-    future = asyncio.run_coroutine_threadsafe(_wait(), loop)
-    try:
-        return bool(future.result(timeout=timeout + 5))
-    except Exception:
-        return False
+    Exception class names plus raw messages leak internal paths and stack hints
+    into API responses and the event stream, while the operator only needs the
+    outcome ("connection refused", "unknown host").
+    """
+    lines = str(exc).strip().splitlines()
+    return (lines[0] if lines else "unknown error")[:200]
 
 
 def config_path(explicit: str | None = None) -> Path:
