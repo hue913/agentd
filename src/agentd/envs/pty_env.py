@@ -41,9 +41,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from ..log import get_logger
 from ..safety.audit import AuditRecord
 from ..safety.gate import LEVEL_BLOCK
-from .ssh_env import SSHHub, classify
+from .ssh_env import SSHHub, cleanup_askpass, classify
 
 # Cap on retained unread output. A forgotten tab running `tail -f` would
 # otherwise grow without bound; the oldest bytes are dropped instead of
@@ -51,8 +52,13 @@ from .ssh_env import SSHHub, classify
 DEFAULT_BUFFER_BYTES = 256 * 1024
 # A session nobody is attached to gets reaped. Without this, a client that dies
 # mid-session leaves a live root shell on the box.
-DEFAULT_IDLE_TTL_S = 1800
+DEFAULT_IDLE_TTL_S = int(os.environ.get("AGENTD_PTY_IDLE_TTL", "1800") or "1800")
 READ_CHUNK = 65536
+# Background reaper cadence. GET /api/pty also reaps opportunistically, but
+# nobody opening the panel must not mean dead shells live forever.
+REAP_INTERVAL_S = int(os.environ.get("AGENTD_PTY_REAP_INTERVAL", "60") or "60")
+
+log = get_logger("agentd.pty")
 
 
 class PTYError(RuntimeError):
@@ -119,6 +125,9 @@ class PTYSession:
         self.master_fd, slave_fd = pty.openpty()
         self._set_winsize(slave_fd, self.rows, self.cols)
         env = self.hub._env(spec)
+        # If ssh needs a password, the askpass script was created for this
+        # session; it must die with the session, not linger in /tmp.
+        self._askpass_path = env.get("SSH_ASKPASS")
         # A predictable prompt and TERM matter: without TERM the remote side
         # falls back to "dumb" and xterm.js renders nothing useful.
         env.setdefault("TERM", "xterm-256color")
@@ -143,9 +152,13 @@ class PTYSession:
             try:
                 chunk = os.read(self.master_fd, READ_CHUNK)
             except OSError as exc:
-                if exc.errno in (errno.EIO, errno.EBADF):
-                    break  # slave closed: the shell exited
-                break
+                if exc.errno not in (errno.EIO, errno.EBADF):
+                    # Honesty for the operator: EIO/EBADF is the ordinary
+                    # "slave closed, shell exited" path, but any other OSError
+                    # also ends the stream (there is no way to keep pumping
+                    # from a dead fd) and must not pass as a normal exit.
+                    log.warning("pty %s: reader stopped on unexpected OSError: %s", self.id, exc)
+                break  # slave closed or fd unusable: the shell is gone either way
             if not chunk:
                 break
             with self._lock:
@@ -219,6 +232,9 @@ class PTYSession:
             os.close(self.master_fd)
         except OSError:
             pass
+        # The askpass script was created for this session's ssh; nothing else
+        # uses it once the child is gone.
+        cleanup_askpass(getattr(self, "_askpass_path", None))
 
     @property
     def alive(self) -> bool:
@@ -252,6 +268,8 @@ class PTYHub:
         self.audit = audit
         self.idle_ttl = idle_ttl
         self.sessions: dict[str, PTYSession] = {}
+        self._reaper: threading.Thread | None = None
+        self._reaper_stop = threading.Event()
 
     def open(self, label: str, purpose: str = "", rows: int = 24, cols: int = 80,
              approved: bool = False) -> PTYSession:
@@ -301,6 +319,40 @@ class PTYHub:
                                     session=sid, error=reason))
         return reaped
 
+    # -- background reaper --------------------------------------------------
+    def start_reaper(self, interval: int = REAP_INTERVAL_S) -> None:
+        """Reap every `interval` seconds from a daemon thread.
+
+        GET /api/pty reaps opportunistically, but only when somebody opens
+        the panel — an abandoned shell with the panel closed never got a
+        second look. The thread is a daemon, so process exit never blocks on
+        it; stop_reaper() shuts it down cleanly at Runtime.close().
+        """
+        if self._reaper and self._reaper.is_alive():
+            return
+        self._reaper_stop.clear()
+        interval = max(1, int(interval))
+
+        def _loop() -> None:
+            # Event.wait doubles as an interruptible sleep: stop_reaper()
+            # returns promptly instead of after a full interval.
+            while not self._reaper_stop.wait(interval):
+                try:
+                    self.reap()
+                except Exception as exc:
+                    # One failed pass (a session dying mid-close, an audit
+                    # hiccup) must not kill the reaper thread.
+                    log.warning("pty reaper pass failed: %s", exc)
+
+        self._reaper = threading.Thread(target=_loop, name="agentd-pty-reaper", daemon=True)
+        self._reaper.start()
+
+    def stop_reaper(self) -> None:
+        self._reaper_stop.set()
+        if self._reaper is not None:
+            self._reaper.join(timeout=5)
+            self._reaper = None
+
     def listing(self) -> list[dict]:
         return [s.digest() for s in self.sessions.values()]
 
@@ -308,5 +360,7 @@ class PTYHub:
         if self.audit is not None:
             try:
                 self.audit.write(record)
-            except Exception:
-                pass  # an audit write must never take down an interactive shell
+            except Exception as exc:
+                # An audit write must never take down an interactive shell —
+                # but it must also not vanish: log it for the operator.
+                log.warning("pty audit write failed: %s", exc)

@@ -240,20 +240,6 @@ def viewer_status(runtime) -> dict:
     }
 
 
-def _flag(text: str, key: str) -> bool:
-    for chunk in text.split():
-        if chunk.startswith(f"{key}="):
-            value = chunk.split("=", 1)[1]
-            return bool(value) and value not in ("", "0", "none", "no")
-    return False
-
-
-def _needs_no_gate(command: str) -> bool:
-    # The install/startup commands are ours, not model-authored, but they still
-    # mutate the host: gate them behind the same approval flag the UI uses.
-    return False
-
-
 def _target_of(hub, label: str) -> str:
     try:
         spec = hub.get_host(label)

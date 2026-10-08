@@ -51,6 +51,16 @@ class SSHError(RuntimeError):
     pass
 
 
+def cleanup_askpass(path: str | None) -> None:
+    """Delete a per-invocation askpass script created by SSHHub._make_askpass."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass  # already gone, or never ours — either way nothing to clean
+
+
 class ApprovalRequired(SSHError):
     def __init__(self, host: str, command: str, verdict: Verdict):
         self.host, self.command, self.verdict = host, command, verdict
@@ -148,19 +158,33 @@ class SSHHub:
         password = os.environ.get(spec.password_env) if spec.password_env else None
         if password:
             env["AGENTD_SSH_PASSWORD"] = password
-            env["SSH_ASKPASS"] = self._askpass_path()
+            env["SSH_ASKPASS"] = self._make_askpass()
             env["SSH_ASKPASS_REQUIRE"] = "force"
             env.pop("DISPLAY", None)
         return env
 
     @staticmethod
-    def _askpass_path() -> str:
-        path = os.path.join(tempfile.gettempdir(), "agentd-askpass.sh")
+    def _make_askpass() -> str:
+        """Create a private per-invocation askpass script and return its path.
+
+        The old fixed path /tmp/agentd-askpass.sh was a race between concurrent
+        sessions and a TOCTOU window: another local user could observe or
+        replace the predictable file between write and exec. mkstemp gives an
+        atomically-created 0600 file (chmod'ed to 0700 before use); the caller
+        removes it via cleanup_askpass() once its ssh child is done.
+        """
         body = '#!/bin/sh\nprintf "%s\\n" "$AGENTD_SSH_PASSWORD"\n'
-        if not os.path.exists(path) or open(path, encoding="utf-8").read() != body:
-            with open(path, "w", encoding="utf-8") as fh:
+        fd, path = tempfile.mkstemp(prefix="agentd-askpass-", suffix=".sh")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(body)
-        os.chmod(path, 0o700)
+            os.chmod(path, 0o700)
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
         return path
 
     # -- execution --------------------------------------------------------
@@ -190,14 +214,20 @@ class SSHHub:
         shell = "bash -lc" if spec.use_login_shell else "sh -c"
         argv = self._ssh_base(label) + [spec.target(), f"{shell} {shlex.quote(command)}"]
         t0 = time.time()
+        env = self._env(spec)
         try:
-            proc = subprocess.run(argv, input=stdin, capture_output=True, text=True,
-                                  timeout=timeout, env=self._env(spec))
-            rc, out, err = proc.returncode, proc.stdout or "", proc.stderr or ""
-        except subprocess.TimeoutExpired:
-            rc, out, err = 124, "", f"timed out after {timeout}s"
-        except FileNotFoundError:
-            raise SSHError("no 'ssh' binary on PATH; install OpenSSH client") from None
+            try:
+                proc = subprocess.run(argv, input=stdin, capture_output=True, text=True,
+                                      timeout=timeout, env=env)
+                rc, out, err = proc.returncode, proc.stdout or "", proc.stderr or ""
+            except subprocess.TimeoutExpired:
+                rc, out, err = 124, "", f"timed out after {timeout}s"
+            except FileNotFoundError:
+                raise SSHError("no 'ssh' binary on PATH; install OpenSSH client") from None
+        finally:
+            # The askpass script is per-invocation; remove it whether the
+            # command succeeded, timed out or raised.
+            cleanup_askpass(env.get("SSH_ASKPASS"))
         duration = int((time.time() - t0) * 1000)
 
         truncated = len(out) > MAX_CAPTURE
@@ -308,9 +338,12 @@ class SSHHub:
                 report["error"] = f"local split short: {name}"
                 return report
             argv = self._ssh_base(label, for_copy=True) + [tmp, f"{spec.target()}:{remote_part}"]
+            part_env = self._env(spec)
             try:
-                proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800, env=self._env(spec))
+                proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800,
+                                      env=part_env)
             finally:
+                cleanup_askpass(part_env.get("SSH_ASKPASS"))
                 os.remove(tmp)
             if proc.returncode != 0 or self._remote_size(label, remote_part) != length:
                 report["error"] = f"upload failed for {name}: {proc.stderr.strip()[:200]}"
