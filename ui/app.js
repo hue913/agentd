@@ -1179,15 +1179,29 @@
       if (gen !== execGen) return;
       execRetryCount = 0;
       if (r && r.blocked) {
-        // A blocked 202 now only means "denied" or "identical batch in flight
-        // past the join window" — the normal parked request answers with real
-        // results itself. Auto-resending either case would open a fresh
-        // approval cycle (a deny-loop), so surface the reason and let the
-        // operator decide via the 重发 button.
+        // Three terminal-ish reasons, per the backend contract:
+        //  1. "…not approved (declined or approval timed out)" — verdict
+        //  2. "no approver configured" — deployment issue
+        //  3. "an identical batch is already in flight" — rare join-window
+        //     miss; an identical batch is still parked, so waiting (and being
+        //     joined into it) is safe. Only case 3 auto-retries; 1 and 2 are
+        //     terminal because resending would open a fresh approval cycle
+        //     (a deny-loop for case 1).
+        const reason = String(r.reason || "");
+        if (reason.includes("identical batch is already in flight")) {
+          setExecStatus("waiting", "同样的批次仍在执行/审批中，自动继续等待…");
+          scheduleExecRetry();
+          return;
+        }
+        const human = reason.includes("not approved")
+          ? "未获批（被拒或审批超时）"
+          : reason.includes("no approver")
+            ? "服务端未配置审批通道（请检查部署配置）"
+            : reason || "需要审批";
         execPending = null;
         stopExecRetry();
-        toast("批量执行未执行：" + (r.reason || "需要审批"), "bad");
-        setExecStatus("waiting", `未执行：${r.reason || "需要审批"}。确认安全后点「立即重发」重新提交。`);
+        toast("批量执行未执行：" + human, "bad");
+        setExecStatus("waiting", `未执行：${human}。确认安全后点「立即重发」重新提交。`);
         return;
       }
       execPending = null;
