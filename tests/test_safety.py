@@ -11,6 +11,7 @@ from agentd.envs.ssh_env import (
 )
 from agentd.safety.audit import AuditLog
 from agentd.safety.gate import classify, initial_readonly
+from agentd.toolbus import CallContext, ToolBus, register_builtins
 
 BLOCKED = [
     "rm -rf /var/www",
@@ -92,6 +93,55 @@ def test_nested_destruction_is_still_blocked():
 def test_custom_block_rules_extend_defaults():
     verdict = classify("touch /etc/shadow", extra_block=[r"touch\s+/etc/"])
     assert verdict.level == "block"
+
+
+# The gate used to wave these through: interpreters sat on the read-only
+# first-word list, so `python3 -c "<anything>"` ran without a human.
+BYPASS_ATTEMPTS = [
+    'python3 -c "import shutil; shutil.rmtree(\'/srv/data\')"',
+    "python -c 'open(\"/etc/passwd\",\"w\").write(\"x\")'",
+    "node -e 'require(\"fs\").rmSync(\"/srv\", {recursive: true})'",
+    "awk 'BEGIN{system(\"rm -rf /srv\")}'",
+    "echo x | fdisk /dev/sda",
+]
+
+
+@pytest.mark.parametrize("command", BYPASS_ATTEMPTS)
+def test_interpreter_and_disk_bypasses_need_approval(command):
+    verdict = classify(command)
+    assert verdict.level in ("confirm", "block"), f"{command!r} -> {verdict.level}"
+    assert not initial_readonly(command), f"{command!r} must not be provably read-only"
+
+
+def test_honest_read_only_commands_stay_read_only():
+    # removing the interpreters must not drag honest readers off the list
+    for command in ("ls -la /srv", "cat /etc/hostname", "grep -r todo /srv/app"):
+        assert classify(command).level == "allow", command
+        assert initial_readonly(command), command
+
+
+def test_fs_write_needs_approval_through_the_bus(tmp_path):
+    """fs.write is RISK_DANGEROUS: the bus forces the approver, because a
+    dedicated write tool that skips approval while `shell > file` needs one is
+    a design contradiction (the tool is the shorter path to agentd.json)."""
+    bus = ToolBus()
+    register_builtins(bus)
+    assert bus.get("fs.write").risk == "dangerous"
+    target = tmp_path / "out.txt"
+    refused = bus.call("fs.write", {"path": str(target), "content": "hi"},
+                       CallContext(approver=lambda payload: False))
+    assert not refused.ok
+    assert "approval" in refused.error
+    assert not target.exists(), "fs.write must not touch the disk without approval"
+
+
+def test_fs_write_runs_once_approved(tmp_path):
+    bus = ToolBus()
+    register_builtins(bus)
+    target = tmp_path / "out.txt"
+    ok = bus.call("fs.write", {"path": str(target), "content": "hi"},
+                  CallContext(approver=lambda payload: True))
+    assert ok.ok and target.read_text(encoding="utf-8") == "hi"
 
 
 def test_argv_quoting_survives_shell_metacharacters():

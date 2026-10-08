@@ -212,10 +212,14 @@ BUILTIN_TOOLS: list[ToolSpec] = [
     _S("fs.read", "Read a local text file.",
        {"type": "object", "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer", "default": MAX_FILE_BYTES}},
         "required": ["path"]}, "builtin", RISK_READ, fs_read),
+    # RISK_DANGEROUS, not RISK_WRITE: the bus only forces the approver for
+    # RISK_DANGEROUS tools. A dedicated file-write tool that skips approval
+    # while `shell > file` needs one is a design contradiction — and this tool
+    # is the shortest path to overwriting agentd.json itself.
     _S("fs.write", "Write or overwrite a local text file.",
        {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"},
                                          "append": {"type": "boolean", "default": False}},
-        "required": ["path", "content"]}, "builtin", RISK_WRITE, fs_write),
+        "required": ["path", "content"]}, "builtin", RISK_DANGEROUS, fs_write),
     _S("fs.ls", "List a local directory.",
        {"type": "object", "properties": {"path": {"type": "string", "default": "."}}, "required": []},
        "builtin", RISK_READ, fs_ls),

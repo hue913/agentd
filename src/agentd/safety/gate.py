@@ -32,6 +32,19 @@ RULES: list[tuple[str, str, str]] = [
     (r"\bfind\b[^\n]*-exec(?:dir)?\s+(?:rm|mv|chmod|dd)\b", "block", "find -exec with a mutating binary"),
     (r"\bbase64\s+(-d|--decode)\b[^\n]*\|\s*(?:ba)?sh\b", "block", "obfuscated payload piped to shell"),
     (r"\beval\b[^\n]*\$\(", "block", "eval of a constructed string"),
+    # Interpreters and JS runtimes executing inline source can do literally
+    # anything (os.system, rmtree, raw syscalls) — the command string itself
+    # proves nothing, so a human reads the code before it runs.
+    (r"\b(?:python|python\d(?:\.\d+)*|pypy\d*|perl|ruby|php)\b[^|;&\n]*\s-[cC]\b",
+     "confirm", "interpreter runs inline code"),
+    (r"\b(?:node|nodejs|deno|bun)\b[^|;&\n]*\s-(?:e|eval|p)\b",
+     "confirm", "JS runtime evaluates inline code"),
+    (r"\bawk\b[^|;&\n]*(?:\bsystem\s*\(|\bgetline\b)",
+     "confirm", "awk spawns commands or reads through getline"),
+    # partition editors rewrite the disk layout; only `-l` listing is harmless
+    # and even that stays behind a confirm because the flag is one typo away
+    (r"\b(?:fdisk|sfdisk|cfdisk|gdisk|parted|partprobe)\b",
+     "confirm", "partition table tool"),
     (r"\bchmod\s+-[Rr]\s+0?777\b", "confirm", "world-writable permissions"),
     (r"\b(?:apt|apt-get|dnf|yum|pacman|brew)\s+(?:remove|purge|uninstall)\b", "confirm", "package removal"),
     (r"\bsystemctl\s+(?:stop|disable|mask|restart|kill)\b", "confirm", "service state change"),
@@ -46,13 +59,17 @@ RULES: list[tuple[str, str, str]] = [
     (r"\bnpm\s+(?:uninstall|publish)\b|\bpip\s+uninstall\b", "confirm", "dependency/publish side effect"),
 ]
 
+# Interpreters (python*, node, awk, ...) and `env` are deliberately absent:
+# each can execute arbitrary code or spawn arbitrary processes, so no command
+# starting with one can be *proven* read-only from its first word. fdisk is
+# likewise gone — its normal mode rewrites partition tables.
 READ_ONLY_FIRST_WORDS = {
-    "ls", "cat", "head", "tail", "less", "grep", "egrep", "find", "fdisk", "df", "du", "ps", "top",
+    "ls", "cat", "head", "tail", "less", "grep", "egrep", "find", "df", "du", "ps", "top",
     "free", "uptime", "who", "w", "id", "which", "whereis", "stat", "file", "wc", "sort", "uniq",
-    "uname", "hostname", "date", "env", "printenv", "ip", "ifconfig", "ss", "netstat", "dig", "nslookup",
+    "uname", "hostname", "date", "printenv", "ip", "ifconfig", "ss", "netstat", "dig", "nslookup",
     "ping", "traceroute", "curl", "wget", "systemctl", "service", "journalctl", "log", "docker",
-    "git", "python3", "python", "node", "npm", "nproc", "lscpu", "lsblk", "sensors", "nvidia-smi",
-    "awk", "sed", "cut", "tr", "tree", "du", "test", "echo", "printf", "md5sum", "sha256sum", "zcat",
+    "git", "npm", "nproc", "lscpu", "lsblk", "sensors", "nvidia-smi",
+    "sed", "cut", "tr", "tree", "test", "echo", "printf", "md5sum", "sha256sum", "zcat",
 }
 
 # Sub-verbs that turn an otherwise read-only binary into a writer.
@@ -64,7 +81,7 @@ WRITE_VERBS = {
     "find": {"-delete", "-exec", "-execdir", "-ok"},
     "sed": {"-i", "--in-place"},
     "curl": {"-o", "--output", "-O", "--remote-name"},
-    "npm": {"install", "i", "uninstall", "publish", "ci"},
+    "npm": {"install", "i", "uninstall", "publish", "ci", "run", "exec", "test", "init"},
 }
 
 _COMPILED = [(re.compile(p, re.IGNORECASE), level, why) for p, level, why in RULES]
