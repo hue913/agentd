@@ -24,14 +24,15 @@ Pick your path:
 It runs on a $5 VPS.
 
 [![ci](https://github.com/hue913/agentd/actions/workflows/ci.yml/badge.svg)](https://github.com/hue913/agentd/actions/workflows/ci.yml)
+[![desktop](https://github.com/hue913/agentd/actions/workflows/release-desktop.yml/badge.svg)](https://github.com/hue913/agentd/actions/workflows/release-desktop.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![python](https://img.shields.io/badge/python-3.11%20%7C%203.12-brightgreen)
 ![gpu](https://img.shields.io/badge/GPU-not%20required-success)
 
 ![The console: a council run with the seats picker](docs/images/console-council.png)
 
-> Desktop client (Tauri, macOS Intel + Apple Silicon, Windows) plus the browser console
-> served by the agent itself: **[hue913/council-agent](https://github.com/hue913/council-agent)**.
+> The Tauri desktop client and browser console now live in this same repository. One project,
+> one API, one auditable trajectory.
 
 ---
 
@@ -159,20 +160,32 @@ The rules of the table:
 
 ![Onboarding: tunnel, token, pick where to start](docs/images/console-onboarding.png)
 
-There are two clients, and they are independent:
+There are two shells over the same agentd runtime:
 
 * **The browser console**: a single no-build bundle served by agentd itself at `/`. Open it
   in a browser over the SSH tunnel.
-* **The desktop client** (Tauri, in the companion repo): a separate implementation that does
-  not load this bundle — no UI code is shared between them today. It opens and supervises
-  the SSH tunnel and adds tray presence.
+* **The desktop client** (Tauri, in `desktop/`): it loads this same bundle, opens and supervises
+  the SSH tunnel, stores bridge credentials in the OS keychain, and adds native window lifecycle.
 
 Desktop builds: macOS universal (Intel + Apple Silicon) and Windows. Windows builds run via
 GitHub Actions — Tauri cannot cross-compile a Windows bundle from a Mac.
 
-→ **[hue913/council-agent](https://github.com/hue913/council-agent)**
+Build locally from `desktop/src-tauri`, or download macOS and Windows assets from the
+[latest agentd release](https://github.com/hue913/agentd/releases).
 
-### 5. Recurring work
+### 5. Auditable runs and browser tasks
+
+Every run exposes a replayable trajectory at `/api/session/{id}/trajectory`. The same store
+records proposals, objections, decisions, approvals, observations, rewards and reflections.
+The optional browser runner uses the existing MiniWoB/WebArena-shaped environment and refuses
+to claim success without a page checker. Use `/api/browser/tasks` to discover safe built-in tasks;
+low-memory servers should keep Playwright disabled.
+
+Task templates and the optional JEV decision model are configured through
+`/api/task-templates` and `/api/decision-model`. JEV only chooses among candidate actions and
+never changes the safety gate or approval boundary.
+
+### 6. Recurring work
 
 Let the agent work on a schedule, with one automatic catch-up run after downtime:
 

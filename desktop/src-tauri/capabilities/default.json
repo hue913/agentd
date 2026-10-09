@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Local tunnel management only. No filesystem or shell scope is granted to the webview.",
+  "windows": ["main"],
+  "permissions": ["core:default", "shell:allow-open"]
+}

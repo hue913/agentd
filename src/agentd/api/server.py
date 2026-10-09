@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 
 from . import ops
@@ -158,6 +159,105 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
             pending.append(entry)
         return {"id": session.id, "task": session.task, "status": session.status,
                 "report": session.report, "pending_approvals": pending}
+
+    @app.get("/api/session/{session_id}/trajectory")
+    def session_trajectory(session_id: str, limit: int = 500):
+        if session_id not in rt.sessions and not rt.trajectory(session_id, 1):
+            raise HTTPException(404, "no such session")
+        return {"run_id": session_id, "events": rt.trajectory(session_id, limit)}
+
+    @app.get("/api/task-templates")
+    def task_templates():
+        return {"templates": rt.task_templates()}
+
+    @app.put("/api/task-templates")
+    def task_templates_update(body: dict):
+        try:
+            return {"templates": rt.save_task_templates(body.get("templates", body))}
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/decision-model")
+    def decision_model():
+        return rt.decision_model()
+
+    @app.put("/api/decision-model")
+    def decision_model_update(body: dict):
+        try:
+            return rt.save_decision_model(body)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/browser/tasks")
+    def browser_tasks():
+        from ..envs.web_tasks import WEB_TASKS
+        return {"tasks": [{"id": name, "goal": factory().goal, "scope": factory().scope}
+                          for name, factory in WEB_TASKS.items()]}
+
+    @app.post("/api/browser/runs", status_code=202)
+    async def browser_run(body: dict):
+        task_name = str(body.get("task") or body.get("task_id") or "").strip()
+        from ..envs.web_tasks import WEB_TASKS
+        if task_name not in WEB_TASKS:
+            raise HTTPException(400, f"unknown browser task: {task_name}")
+        run_id = uuid.uuid4().hex[:12]
+        record = {"id": run_id, "task": task_name, "status": "queued", "success": False,
+                  "steps": [], "created_at": time.time()}
+        rt.browser_runs[run_id] = record
+        rt.store.add_trajectory_event(run_id, "status", json.dumps({"status": "queued", "task": task_name}, ensure_ascii=False))
+
+        async def execute() -> None:
+            try:
+                from playwright.sync_api import sync_playwright
+                from ..envs.browser_env import BrowserEnv
+                task = WEB_TASKS[task_name]()
+                record["status"] = "running"
+                rt.store.add_trajectory_event(run_id, "status", "running")
+                def work():
+                    with sync_playwright() as playwright:
+                        browser = playwright.chromium.launch(headless=True)
+                        page = browser.new_page()
+                        env = BrowserEnv(page, task)
+                        state = env.reset()
+                        rt.store.add_trajectory_event(run_id, "state", state)
+                        # This endpoint is an auditable runner primitive. It deliberately
+                        # does not invent an LLM action policy; callers can submit the
+                        # existing agent loop through /api/session for model decisions.
+                        path = Path(rt.db_path).parent / "browser-runs" / f"{run_id}.png"
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        page.screenshot(path=str(path))
+                        browser.close()
+                        return [{"index": 0, "action": "observe", "screenshot_id": path.name}], state
+                steps, _ = await asyncio.to_thread(work)
+                record.update({"status": "ready", "success": False, "steps": steps,
+                               "screenshot": str(Path(rt.db_path).parent / "browser-runs" / f"{run_id}.png")})
+                rt.store.add_trajectory_event(run_id, "observation", "initial page captured", f"{run_id}.png")
+            except Exception as exc:
+                record.update({"status": "error", "error": _short_reason(exc)})
+                rt.store.add_trajectory_event(run_id, "reflection", record["error"])
+        asyncio.create_task(execute())
+        return record
+
+    @app.get("/api/browser/runs/{run_id}")
+    def browser_run_get(run_id: str):
+        record = rt.browser_runs.get(run_id)
+        if record is None:
+            raise HTTPException(404, "browser run not found")
+        return record
+
+    @app.get("/api/browser/runs/{run_id}/trajectory")
+    def browser_run_trajectory(run_id: str):
+        if run_id not in rt.browser_runs and not rt.trajectory(run_id, 1):
+            raise HTTPException(404, "browser run not found")
+        return {"run_id": run_id, "events": rt.trajectory(run_id)}
+
+    @app.get("/api/browser/runs/{run_id}/screenshots/{screenshot_id}")
+    def browser_screenshot(run_id: str, screenshot_id: str):
+        from fastapi.responses import FileResponse
+        path = Path(rt.db_path).parent / "browser-runs" / screenshot_id
+        if run_id not in rt.browser_runs or path.name != f"{run_id}.png" or not path.is_file():
+            raise HTTPException(404, "screenshot not found")
+        return FileResponse(path, media_type="image/png")
 
     @app.post("/api/approve")
     def approve(body: dict):

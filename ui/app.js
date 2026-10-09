@@ -271,6 +271,19 @@
     }
   }
 
+  async function loadTaskTemplates() {
+    const select = $("task-template");
+    if (!select) return;
+    try {
+      const payload = await api("api/task-templates");
+      for (const template of payload.templates || []) {
+        const option = new Option(template.title || template.id, template.id);
+        option.dataset.goal = template.goal || "";
+        select.add(option);
+      }
+    } catch (_) { /* templates are an enhancement; the free-form task remains usable */ }
+  }
+
   /* ───────────────────────── council ───────────────────────── */
 
   /* Generation token for the two polling chains. Starting a new session (or
@@ -1524,6 +1537,10 @@
       if (b) goto(b.dataset.view);
     });
     $("btn-run").onclick = runCouncil;
+    $("task-template").onchange = () => {
+      const option = $("task-template").selectedOptions[0];
+      if (option && option.dataset.goal) $("task-input").value = option.dataset.goal;
+    };
     $("btn-pty-open").onclick = openPty;
     $("btn-pty-close").onclick = closePty;
     $("btn-grab").onclick = grabFrame;
@@ -1584,6 +1601,7 @@
         try {
           await api("api/state");
           await loadState();
+          await loadTaskTemplates();
           loadSeatPicker();
           refreshOps();
         } catch (_) {

@@ -1,0 +1,37 @@
+[package]
+name = "agentd-desktop"
+version = "0.1.0"
+description = "agentd desktop: multi-model council, SSH terminal, server screen, ops panel"
+authors = ["agentd contributors"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "agentd_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+portable-pty = "0.8"
+# SSH tunnel by invoking the system ssh client rather than linking a Rust SSH
+# stack. Two reasons: the user's own ~/.ssh/config, agent, keys and ProxyJump
+# keep working, and the tunnel carries no credentials of our own.
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

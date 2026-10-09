@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: agentd
+message: "If agentd contributes to your work, please cite this repository."
+type: software
+authors:
+  - family-names: "Hu"
+    given-names: "Yue"
+repository-code: "https://github.com/hue913/agentd"
+license: Apache-2.0

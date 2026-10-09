@@ -63,6 +63,15 @@ CREATE TABLE IF NOT EXISTS risks (
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_task  ON episodes(task);
 CREATE INDEX IF NOT EXISTS idx_risks_episode  ON risks(episode_id);
+CREATE TABLE IF NOT EXISTS trajectory_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    screenshot  TEXT,
+    ts          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trajectory_run ON trajectory_events(run_id, id);
 PRAGMA journal_mode=WAL;
 """
 
@@ -118,6 +127,22 @@ class Episode:
     score: float | None = None
     analysis: str = ""
     meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class TrajectoryEvent:
+    id: int
+    run_id: str
+    event_type: str
+    content: str
+    screenshot: str | None
+    ts: float
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id, "run_id": self.run_id, "type": self.event_type,
+            "content": self.content, "screenshot_id": self.screenshot, "ts": self.ts,
+        }
 
 
 class Store:
@@ -301,6 +326,34 @@ class Store:
             (episode_id, time.time(), member, description, severity, detail),
         )
         self.db.commit()
+
+    # -- auditable trajectories ------------------------------------------
+    @_transaction
+    def add_trajectory_event(self, run_id: str, event_type: str, content: str,
+                             screenshot: str | None = None) -> int:
+        """Append one redacted, queryable event to a run's audit trail."""
+        if not run_id or event_type not in {
+            "state", "proposal", "objection", "decision", "tool", "approval",
+            "observation", "reward", "reflection", "status",
+        }:
+            raise ValueError("invalid trajectory event")
+        cur = self.db.execute(
+            "INSERT INTO trajectory_events(run_id,event_type,content,screenshot,ts) "
+            "VALUES(?,?,?,?,?)", (run_id, event_type, str(content)[:20000], screenshot, time.time()),
+        )
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    @_transaction
+    def trajectory_for(self, run_id: str, limit: int = 500) -> list[TrajectoryEvent]:
+        rows = self.db.execute(
+            "SELECT * FROM trajectory_events WHERE run_id=? ORDER BY id LIMIT ?",
+            (run_id, max(1, min(int(limit), 2000))),
+        ).fetchall()
+        return [TrajectoryEvent(
+            id=r["id"], run_id=r["run_id"], event_type=r["event_type"],
+            content=r["content"], screenshot=r["screenshot"], ts=r["ts"],
+        ) for r in rows]
 
     @_transaction
     def risks_for(self, episode_id: int | None = None, limit: int = 50) -> list[dict]:

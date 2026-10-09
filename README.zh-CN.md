@@ -23,14 +23,14 @@
 它能跑在一台 5 美元的 VPS 上。
 
 [![ci](https://github.com/hue913/agentd/actions/workflows/ci.yml/badge.svg)](https://github.com/hue913/agentd/actions/workflows/ci.yml)
+[![desktop](https://github.com/hue913/agentd/actions/workflows/release-desktop.yml/badge.svg)](https://github.com/hue913/agentd/actions/workflows/release-desktop.yml)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![python](https://img.shields.io/badge/python-3.11%20%7C%203.12-brightgreen)
 ![gpu](https://img.shields.io/badge/GPU-不需要-success)
 
 ![控制台：一场带着席位选择器的圆桌会](docs/images/console-council.png)
 
-> 桌面客户端（Tauri：macOS 英特尔 + M 系列、Windows）与 Agent 自己托管的浏览器控制台：
-> **[hue913/council-agent](https://github.com/hue913/council-agent)**
+> Tauri 桌面端和浏览器控制台现在都在这个仓库里：同一个项目、同一个 API、同一份可审计轨迹。
 
 ---
 
@@ -149,19 +149,29 @@ POST /api/session
 
 ![引导页：开隧道、验证令牌、挑一个开始](docs/images/console-onboarding.png)
 
-客户端有两个，互相独立：
+客户端有两个入口，但共用同一个 agentd 运行时：
 
 * **浏览器控制台**：一份无构建的单页 bundle，由 agentd 自己伺服在 `/`。通过 SSH 隧道在
   浏览器里打开即可。
-* **桌面客户端**（Tauri，见 companion 仓库）：独立实现，不加载这份 bundle，两者不共享
-  UI 代码。它负责打开并守护 SSH 隧道，附带托盘常驻。
+* **桌面客户端**（Tauri，位于 `desktop/`）：加载同一份 bundle，负责打开并守护 SSH 隧道，
+  将桥接凭据放进系统钥匙串，并管理原生窗口生命周期。
 
 桌面客户端的构建目标：macOS 通用包（英特尔 + M 系列）与 Windows。Windows 包走 GitHub
 Actions——Tauri 无法从 Mac 交叉编译 Windows 包。
 
-→ **[hue913/council-agent](https://github.com/hue913/council-agent)**
+可以在 `desktop/src-tauri` 本地构建，也可以从
+[agentd Releases](https://github.com/hue913/agentd/releases) 下载 macOS 和 Windows 安装包。
 
-### 5. 例行工作
+### 5. 可审计运行与浏览器任务
+
+每次运行都能通过 `/api/session/{id}/trajectory` 回放；提案、异议、裁决、审批、观察、奖励
+和反思都写入同一个 SQLite。可选浏览器 runner 复用 MiniWoB/WebArena 风格环境，没有页面检查器
+返回成功就不会伪造成功。用 `/api/browser/tasks` 查看内置安全任务；内存较小的服务器应关闭 Playwright。
+
+任务模板和可选 JEV 决策模型分别通过 `/api/task-templates`、`/api/decision-model` 配置。JEV
+只能从候选动作里选择，不能改变安全门或审批边界。
+
+### 6. 例行工作
 
 让 Agent 定时干活，宕机后自动补跑一次：
 

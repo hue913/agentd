@@ -94,6 +94,22 @@ def post(url: str, payload: dict) -> tuple[int, object]:
             return exc.code, raw
 
 
+def put(url: str, payload: dict) -> tuple[int, object]:
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="PUT",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {TEST_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode()
+            return resp.status, (json.loads(body) if body[:1] in "{[" else body)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode()
+        try:
+            return exc.code, json.loads(raw)
+        except ValueError:
+            return exc.code, raw
+
+
 def delete(url: str) -> tuple[int, object]:
     req = urllib.request.Request(url, method="DELETE",
                                  headers={"Authorization": f"Bearer {TEST_TOKEN}"})
@@ -179,6 +195,38 @@ def test_memory_endpoints(server):
 
     code, audit = get(f"{base}/api/audit")
     assert code == 200 and "entries" in audit
+
+
+def test_templates_decision_model_and_session_trajectory(server):
+    base, runtime = server
+    code, payload = get(f"{base}/api/task-templates")
+    assert code == 200 and any(item["id"] == "ops-triage" for item in payload["templates"])
+
+    code, model = get(f"{base}/api/decision-model")
+    assert code == 200 and model["enabled"] is False
+    code, model = put(f"{base}/api/decision-model", {"enabled": False, "fallback": "human"})
+    assert code == 200 and model["fallback"] == "human"
+
+    code, body = post(f"{base}/api/session", {"task": "nginx-down", "provider": "demo",
+                                             "learning": True, "max_steps": 1})
+    assert code == 200
+    session_id = body["session"]
+    for _ in range(120):
+        code, state = get(f"{base}/api/session/{session_id}")
+        if state["status"] in ("success", "failed", "error"):
+            break
+        time.sleep(0.05)
+    code, trajectory = get(f"{base}/api/session/{session_id}/trajectory")
+    assert code == 200 and trajectory["events"]
+    assert {event["type"] for event in trajectory["events"]} >= {"status"}
+
+
+def test_browser_task_discovery_is_safe(server):
+    base, _ = server
+    code, payload = get(f"{base}/api/browser/tasks")
+    assert code == 200 and any(item["id"] == "contact-form" for item in payload["tasks"])
+    code, body = post(f"{base}/api/browser/runs", {"task": "missing"})
+    assert code == 400 and "unknown browser task" in str(body)
 
 
 def test_ssh_unknown_host_is_a_typed_502(server):

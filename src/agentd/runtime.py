@@ -31,6 +31,7 @@ from .providers import (
 from .safety.audit import AuditLog
 from .toolbus import ToolBus, load_plugin_dir, load_skill_dir, register_builtins, register_mcp_server
 from .toolbus.mcp_client import MCPServerStdio
+from .templates import templates_from_config
 
 log = get_logger("agentd.runtime")
 
@@ -106,6 +107,7 @@ class Runtime:
         self.providers = self._build_providers()
         self.kernel = self._build_kernel(enabled=True)
         self.extensions = self._load_extensions()
+        self.browser_runs: OrderedDict[str, dict] = OrderedDict()
 
     # -- wiring -----------------------------------------------------------
     def _build_providers(self) -> dict[str, object]:
@@ -548,21 +550,63 @@ class Runtime:
     def run_session(self, session: Session) -> dict:
         self._local.session = session
         session.status = "running"
+        self.store.add_trajectory_event(session.id, "status", json.dumps({"status": "running", "task": session.task}, ensure_ascii=False))
         self.publish({"type": "session_started", "session": session.id, "task": session.task})
         try:
             task = session.task_obj if session.task_obj is not None else BUILTIN_TASKS[session.task]()
             report = session.loop.run(task)
             session.report = report.as_dict()
             session.status = "success" if report.success else "failed"
+            self.store.add_trajectory_event(session.id, "decision", json.dumps(session.report, ensure_ascii=False, default=str))
+            self.store.add_trajectory_event(session.id, "reward", json.dumps({"success": bool(report.success), "steps": len(report.steps)}, ensure_ascii=False))
         except Exception as exc:
             session.status = "error"
             session.report = {"error": _short_reason(exc)}
+            self.store.add_trajectory_event(session.id, "reflection", session.report["error"])
             self.publish({"type": "session_error", "session": session.id, "error": _short_reason(exc)})
         finally:
             self._local.session = None
         self.publish({"type": "session_finished", "session": session.id, "status": session.status,
                       "report": session.report})
+        self.store.add_trajectory_event(session.id, "status", json.dumps({"status": session.status}, ensure_ascii=False))
         return session.report or {}
+
+    def trajectory(self, run_id: str, limit: int = 500) -> list[dict]:
+        return [event.as_dict() for event in self.store.trajectory_for(run_id, limit)]
+
+    def task_templates(self) -> list[dict]:
+        return templates_from_config(self.config)
+
+    def save_task_templates(self, templates: list[dict]) -> list[dict]:
+        if not isinstance(templates, list) or len(templates) > 100:
+            raise ValueError("task_templates must be a list with at most 100 entries")
+        clean = []
+        for item in templates:
+            if not isinstance(item, dict) or not str(item.get("id", "")).strip():
+                raise ValueError("each task template needs an id")
+            clean.append({str(k): v for k, v in item.items()})
+        self.config["task_templates"] = clean
+        self.save_config()
+        return clean
+
+    def decision_model(self) -> dict:
+        value = self.config.get("decision_model")
+        return dict(value) if isinstance(value, dict) else {"enabled": False, "provider": "jev", "fallback": "council"}
+
+    def save_decision_model(self, body: dict) -> dict:
+        if not isinstance(body, dict):
+            raise ValueError("decision model must be an object")
+        fallback = str(body.get("fallback", "council"))
+        if fallback not in {"council", "human"}:
+            raise ValueError("fallback must be council or human")
+        value = {"enabled": bool(body.get("enabled", False)), "provider": "jev",
+                 "endpoint": str(body.get("endpoint", "")).strip(),
+                 "model": str(body.get("model", "")).strip(), "fallback": fallback}
+        if value["enabled"] and (not value["endpoint"] or not value["model"]):
+            raise ValueError("enabled decision model needs endpoint and model")
+        self.config["decision_model"] = value
+        self.save_config()
+        return value
 
     def publish(self, event: dict) -> None:
         event["ts"] = time.time()
