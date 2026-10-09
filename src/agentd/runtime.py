@@ -557,6 +557,24 @@ class Runtime:
             report = session.loop.run(task)
             session.report = report.as_dict()
             session.status = "success" if report.success else "failed"
+            # Keep the high-value parts of the loop trace in the same replayable
+            # stream as lifecycle events. Raw provider prompts and credentials
+            # are never copied here; tool output is bounded by the trace itself.
+            for trace in session.report.get("trace", []):
+                self.store.add_trajectory_event(session.id, "state", trace.get("state", ""))
+                self.store.add_trajectory_event(
+                    session.id, "observation", trace.get("tool_output", "") or "",
+                )
+                self.store.add_trajectory_event(
+                    session.id, "tool", json.dumps({
+                        "action": trace.get("chosen_action", ""),
+                        "risk": trace.get("risk", ""), "ok": trace.get("ok", True),
+                    }, ensure_ascii=False),
+                )
+            for council in session.report.get("council", []):
+                self.store.add_trajectory_event(
+                    session.id, "proposal", json.dumps(council, ensure_ascii=False, default=str),
+                )
             self.store.add_trajectory_event(session.id, "decision", json.dumps(session.report, ensure_ascii=False, default=str))
             self.store.add_trajectory_event(session.id, "reward", json.dumps({"success": bool(report.success), "steps": len(report.steps)}, ensure_ascii=False))
         except Exception as exc:
