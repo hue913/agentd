@@ -1,0 +1,38 @@
+name: release-desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            args: --target universal-apple-darwin
+          - os: windows-latest
+            args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Tauri CLI
+        shell: bash
+        run: cargo install tauri-cli --version "^2"
+      - name: Build desktop bundle
+        working-directory: desktop/src-tauri
+        shell: bash
+        run: cargo tauri build ${{ matrix.args }}
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentd-${{ matrix.os }}
+          path: |
+            desktop/src-tauri/target/release/bundle/**/*.dmg
+            desktop/src-tauri/target/release/bundle/**/*.exe
+            desktop/src-tauri/target/release/bundle/**/*.msi
