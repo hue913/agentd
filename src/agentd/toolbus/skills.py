@@ -99,7 +99,7 @@ def _make_handler(skill: Skill):
             return ToolResult(
                 ok=False, risk=RISK_WRITE,
                 error=(f"skill '{skill.name}' runs a non-read-only command ({rendered[:120]}); "
-                       "requires approval=true after the user confirms"),
+                       "requires the operator to approve it before it can run"),
             )
         try:
             proc = subprocess.run(rendered, shell=True, capture_output=True, text=True, timeout=180)

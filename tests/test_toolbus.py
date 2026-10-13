@@ -65,8 +65,54 @@ def test_dangerous_tool_needs_approval(bus):
     ctx = CallContext(approved=False)
     result = bus.call("local.exec", {"command": "rm -rf /tmp/definitely-not-here"}, ctx)
     assert not result.ok and "safety gate" in result.error
-    allowed = bus.call("local.exec", {"command": "rm -rf /tmp/definitely-not-here", "approved": True}, ctx)
+    # Approval is a property of the trusted call context -- the runtime sets it
+    # only after a human answered /api/approve. It is not an argument.
+    allowed = bus.call("local.exec", {"command": "rm -rf /tmp/definitely-not-here"},
+                       CallContext(approved=True))
     assert allowed.ok or allowed.data.get("rc") in (0, 1)
+
+
+def test_model_cannot_approve_its_own_command(bus, tmp_path):
+    """Regression: `approved` used to be a model-writable tool argument.
+
+    A model proposing `local.exec {"command": ..., "approved": true}` talked
+    straight past the gate -- including past a hard `block` verdict. The gate
+    has to be the decider, so the argument must be refused outright.
+    """
+    target = tmp_path / "owned.txt"
+
+    # 1. The argument is not in the schema the model is shown.
+    for name in ("local.exec", "ssh.exec"):
+        assert "approved" not in bus.get(name).parameters["properties"], \
+            f"{name} still advertises 'approved' to the model"
+
+    # 2. Supplying it anyway is refused visibly, and nothing runs.
+    result = bus.call("local.exec",
+                      {"command": f"echo owned > {target}", "approved": True}, CallContext())
+    assert not result.ok
+    assert "approved" in result.error
+    assert not target.exists(), "the self-approved command actually ran"
+
+    # 3. The same trick cannot clear a hard `block` verdict either. Argument
+    #    validation fires before the handler, so the call never reaches the gate
+    #    at all; what matters is that nothing ran.
+    blocked_cmd = 'echo "dd of=/dev/sda1"'
+    blocked = bus.call("local.exec", {"command": blocked_cmd, "approved": True}, CallContext())
+    assert not blocked.ok
+    assert "safety gate" in bus.call("local.exec", {"command": blocked_cmd}, CallContext()).error
+
+    # 4. The trusted context still works, so human approval is not collateral damage.
+    human = bus.call("local.exec", {"command": f"echo owned > {target}"}, CallContext(approved=True))
+    assert human.ok and target.exists()
+
+
+def test_unprovable_write_asks_for_a_human_not_for_an_argument(bus, tmp_path):
+    """The refusal message must not teach the model how to grant itself approval."""
+    target = tmp_path / "x.txt"
+    result = bus.call("local.exec", {"command": f"echo x > {target}"}, CallContext())
+    assert not result.ok and not target.exists()
+    assert "approved=true" not in result.error, \
+        "the refusal still points the model at the removed argument"
 
 
 def test_readonly_builtin_runs(bus):

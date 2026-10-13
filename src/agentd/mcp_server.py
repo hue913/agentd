@@ -9,6 +9,7 @@ so the safety gate, the audit log and the approval path stay in force.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import TextIO
 
@@ -16,6 +17,10 @@ from .toolbus.spec import RISK_DANGEROUS
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "agentd", "version": "0.1.0"}
+
+# Whether an MCP client may pre-approve its own tool calls. Off by default: the
+# client is an agent, and an agent that can approve itself defeats the gate.
+_MCP_PREAPPROVED = os.environ.get("AGENTD_MCP_PREAPPROVED") == "1"
 
 RESOURCES = {
     "agentd://memory": "The full experience pack as JSON (state, action, return).",
@@ -89,7 +94,13 @@ def handle(message: dict, runtime, bus) -> dict | None:
     if method == "tools/call":
         name = params.get("name", "")
         arguments = dict(params.get("arguments") or {})
-        approved = bool(arguments.pop("approved", False))
+        # A caller of this MCP server is an agent, so honouring an `approved`
+        # argument would hand it the one authority the safety gate withholds --
+        # the same self-grant the tool schemas were fixed to remove. Pre-approval
+        # is therefore opt-in per deployment, and a rejected one is reported back
+        # rather than silently dropped.
+        preapproved = bool(arguments.pop("approved", False))
+        approved = preapproved and _MCP_PREAPPROVED
         from .toolbus import CallContext
 
         ctx = CallContext(session="mcp", approved=approved, approver=None,
@@ -100,6 +111,10 @@ def handle(message: dict, runtime, bus) -> dict | None:
                    "isError": not outcome.ok}
         if outcome.error:
             payload["content"].append({"type": "text", "text": f"error: {outcome.error}"})
+        if preapproved and not approved:
+            payload["content"].append({"type": "text", "text": (
+                "note: 'approved' was ignored — MCP pre-approval is disabled on this "
+                "deployment (set AGENTD_MCP_PREAPPROVED=1 to allow it)")})
         return result(payload)
     if method in ("prompts/list",):
         return result({"prompts": []})

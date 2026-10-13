@@ -26,15 +26,23 @@ def _clip(text: str) -> str:
     return f"{head}\n... [{len(text) - MAX_OUTPUT} chars elided] ...\n{tail}"
 
 
-def local_exec(command: str, timeout: int = 60, approved: bool = False, ctx=None) -> ToolResult:
+def local_exec(command: str, timeout: int = 60, ctx=None) -> ToolResult:
     """Run a shell command locally.
 
     shell=True stays because an ops agent needs pipes and globs, so the safety
     boundary is not the API choice but this rule: anything the gate cannot prove
     read-only requires a human, and everything is classified before it runs.
+
+    There is deliberately no `approved` parameter. Approval used to be readable
+    from the tool arguments, which meant the model could grant itself the very
+    permission the gate exists to withhold — `{"command": "rm -rf /", "approved":
+    true}` short-circuited even a hard block. Approval is now a property of the
+    trusted call context only: the runtime sets `ctx.approved` after a human has
+    actually answered `/api/approve`. Passing `approved` as an argument is
+    rejected by argument validation, visibly, instead of quietly working.
     """
     verdict = classify(command)
-    human_ok = approved or bool(ctx and ctx.approved)
+    human_ok = bool(ctx and ctx.approved)
     if verdict.hard_blocked and not human_ok:
         return ToolResult(ok=False, risk=RISK_DANGEROUS,
                           error=f"blocked by safety gate: {'; '.join(verdict.reasons)}")
@@ -43,7 +51,7 @@ def local_exec(command: str, timeout: int = 60, approved: bool = False, ctx=None
             ok=False, risk=RISK_WRITE,
             error=(f"'{command}' is not provably read-only"
                    + (f" ({'; '.join(verdict.reasons)})" if verdict.reasons else "")
-                   + "; re-request with approved=true after the user confirms"),
+                   + "; surface this command to the operator for approval, then retry"),
         )
     t0 = time.time()
     try:
@@ -102,11 +110,11 @@ def _hub(ctx):
     return ctx.ssh
 
 
-def ssh_exec(host: str, command: str, timeout: int = 60, approved: bool = False, ctx=None) -> ToolResult:
+def ssh_exec(host: str, command: str, timeout: int = 60, ctx=None) -> ToolResult:
     hub = _hub(ctx)
     if hub is None:
         return ToolResult(ok=False, error="no SSH hub configured (add a host with agentd host add)")
-    human_ok = approved or bool(ctx and ctx.approved)
+    human_ok = bool(ctx and ctx.approved)
     try:
         result = hub.exec(host, command, timeout=timeout, approved=human_ok,
                           session=getattr(ctx, "session", None), episode_id=getattr(ctx, "episode_id", None))
@@ -205,9 +213,11 @@ def human_request(reason: str, ctx=None) -> ToolResult:
 _S = ToolSpec
 
 BUILTIN_TOOLS: list[ToolSpec] = [
+    # `approved` is intentionally absent from both exec schemas. It is a decision
+    # the human makes, not a field the model fills in; exposing it is what let a
+    # model talk its way past the gate (see local_exec's docstring).
     _S("local.exec", "Run a shell command on the machine hosting agentd.",
-       {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "default": 60},
-                                         "approved": {"type": "boolean", "default": False}},
+       {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "default": 60}},
         "required": ["command"]}, "builtin", RISK_WRITE, local_exec),
     _S("fs.read", "Read a local text file.",
        {"type": "object", "properties": {"path": {"type": "string"}, "max_bytes": {"type": "integer", "default": MAX_FILE_BYTES}},
@@ -226,8 +236,7 @@ BUILTIN_TOOLS: list[ToolSpec] = [
 
     _S("ssh.exec", "Run a command on a configured SSH host through the safety gate.",
        {"type": "object", "properties": {"host": {"type": "string"}, "command": {"type": "string"},
-                                         "timeout": {"type": "integer", "default": 60},
-                                         "approved": {"type": "boolean", "default": False}},
+                                         "timeout": {"type": "integer", "default": 60}},
         "required": ["host", "command"]}, "builtin", RISK_WRITE, ssh_exec,
        examples=["ssh.exec(host='app-01', command='systemctl status nginx')"]),
     _S("ssh.tail_log", "Read the tail of a remote log file.",
