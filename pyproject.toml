@@ -13,7 +13,7 @@ api = [
   "websockets>=12",
 ]
 browser = ["playwright>=1.44"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 agentd = "agentd.cli:main"
@@ -28,6 +28,15 @@ packages = ["src/agentd"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# The existing tree predates ruff. Gate CI on real bugs (undefined names,
+# syntax) rather than a 200-item style backlog.
+select = ["E9", "F63", "F7", "F82"]
 
 [tool.uv]
 # Intel mac / CN network: never compile Rust wheels from source, prefer the mirror.

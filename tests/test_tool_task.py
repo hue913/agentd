@@ -107,7 +107,7 @@ def test_malformed_action_is_an_observation_not_an_exception():
 def test_finish_ends_the_episode_with_the_answer():
     task = ToolTask(goal_text="x", hosts=[])
     state, done, reward = task.apply('finish {"answer": "all clear"}', CallContext())
-    assert done and reward == 1.0
+    assert done and reward is None
     assert "all clear" in state
 
 
@@ -141,7 +141,10 @@ def test_loop_runs_a_tool_goal_to_finish(tmp_path):
     loop = AgentLoop(kernel, provider, bus, context=ContextBuilder(), ledger=Ledger(),
                      config=LoopConfig(max_steps=4, reflect=False))
     report = loop.run(task)
-    assert report.success is True
+    # finish is unverified: the episode ends, the answer is kept, but it is
+    # not recorded as a success the kernel can later retrieve as +1.
+    assert report.success is False
+    assert "unverified finish" in report.stopped_by
     assert "hello was echoed" in report.final
     assert len(report.steps) == 2
     assert "demo.echo" in report.steps[0].chosen_action

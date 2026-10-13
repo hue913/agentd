@@ -226,14 +226,19 @@ class MCPServerStdio:
 
 
 def _risk_for(tool_def: dict) -> str:
+    """Outbound MCP tools are untrusted code on someone else's process.
+
+    Only an explicit readOnlyHint keeps a tool off the approval path.
+    Destructive stays dangerous; everything else is at least a write, and
+    writes without a read-only claim are treated as dangerous so the human
+    sees them before they run.
+    """
     annotations = tool_def.get("annotations") or {}
     if annotations.get("destructiveHint"):
         return RISK_DANGEROUS
     if annotations.get("readOnlyHint"):
         return RISK_READ
-    if annotations.get("openWorldHint") or annotations.get("idempotentHint") is False:
-        return RISK_WRITE
-    return RISK_WRITE
+    return RISK_DANGEROUS
 
 
 def register_mcp_server(bus, server: MCPServerStdio) -> dict:

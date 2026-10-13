@@ -30,7 +30,7 @@ class MockProvider(Provider):
             notes="mock",
         )
 
-    def text(self, prompt: str) -> tuple[str, Usage]:
+    def text(self, prompt: str, tools: list[dict] | None = None) -> tuple[str, Usage]:
         reply = self.critiques.pop(0) if self.critiques else '{"objections": []}'
-        self.calls.append({"text_prompt": prompt, "reply": reply})
+        self.calls.append({"text_prompt": prompt, "reply": reply, "tools": tools or []})
         return reply, Usage(prompt_tokens=len(prompt) // 4, completion_tokens=20)

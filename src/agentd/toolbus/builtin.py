@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from ..safety.gate import classify, initial_readonly
+from .paths import PathRefused, resolve_allowed
 from .spec import RISK_DANGEROUS, RISK_READ, RISK_WRITE, ToolResult, ToolSpec
 
 MAX_OUTPUT = 40_000
@@ -43,6 +44,22 @@ def local_exec(command: str, timeout: int = 60, ctx=None) -> ToolResult:
     """
     verdict = classify(command)
     human_ok = bool(ctx and ctx.approved)
+    if not human_ok:
+        # Ask the human here so a RISK_WRITE tool still has a working
+        # approval loop. The bus only auto-prompts for RISK_DANGEROUS.
+        if verdict.hard_blocked or not initial_readonly(command):
+            granted = bool(ctx and ctx.approver and ctx.approver({
+                "tool": "local.exec", "command": command, "risk": RISK_DANGEROUS
+                if verdict.hard_blocked else RISK_WRITE, **verdict.as_dict(),
+            }))
+            if not granted:
+                return ToolResult(
+                    ok=False, risk=RISK_DANGEROUS if verdict.hard_blocked else RISK_WRITE,
+                    error=(f"'{command}' needs human approval"
+                           + (f" ({'; '.join(verdict.reasons)})" if verdict.reasons else "")
+                           + "; the operator must confirm it in the console"),
+                )
+            human_ok = True
     if verdict.hard_blocked and not human_ok:
         return ToolResult(ok=False, risk=RISK_DANGEROUS,
                           error=f"blocked by safety gate: {'; '.join(verdict.reasons)}")
@@ -51,7 +68,7 @@ def local_exec(command: str, timeout: int = 60, ctx=None) -> ToolResult:
             ok=False, risk=RISK_WRITE,
             error=(f"'{command}' is not provably read-only"
                    + (f" ({'; '.join(verdict.reasons)})" if verdict.reasons else "")
-                   + "; surface this command to the operator for approval, then retry"),
+                   + "; the operator must confirm it in the console"),
         )
     t0 = time.time()
     try:
@@ -71,7 +88,10 @@ def local_exec(command: str, timeout: int = 60, ctx=None) -> ToolResult:
 
 
 def fs_read(path: str, max_bytes: int = MAX_FILE_BYTES) -> ToolResult:
-    target = Path(path).expanduser()
+    try:
+        target = resolve_allowed(path, write=False)
+    except PathRefused as exc:
+        return ToolResult(ok=False, error=str(exc), risk=RISK_READ)
     if not target.exists():
         return ToolResult(ok=False, error=f"no such file: {path}")
     if target.is_dir():
@@ -82,7 +102,10 @@ def fs_read(path: str, max_bytes: int = MAX_FILE_BYTES) -> ToolResult:
 
 
 def fs_write(path: str, content: str, append: bool = False) -> ToolResult:
-    target = Path(path).expanduser()
+    try:
+        target = resolve_allowed(path, write=True)
+    except PathRefused as exc:
+        return ToolResult(ok=False, error=str(exc), risk=RISK_DANGEROUS)
     target.parent.mkdir(parents=True, exist_ok=True)
     if append:
         with target.open("a", encoding="utf-8") as fh:
@@ -93,7 +116,10 @@ def fs_write(path: str, content: str, append: bool = False) -> ToolResult:
 
 
 def fs_ls(path: str = ".") -> ToolResult:
-    target = Path(path).expanduser()
+    try:
+        target = resolve_allowed(path, write=False)
+    except PathRefused as exc:
+        return ToolResult(ok=False, error=str(exc), risk=RISK_READ)
     if not target.exists():
         return ToolResult(ok=False, error=f"no such path: {path}")
     if target.is_file():
@@ -252,7 +278,7 @@ BUILTIN_TOOLS: list[ToolSpec] = [
     _S("ssh.upload", "Upload a local file to a remote host, chunked with md5 verification.",
        {"type": "object", "properties": {"host": {"type": "string"}, "local": {"type": "string"},
                                          "remote": {"type": "string"}},
-        "required": ["host", "local", "remote"]}, "builtin", RISK_WRITE, ssh_upload),
+        "required": ["host", "local", "remote"]}, "builtin", RISK_DANGEROUS, ssh_upload),
 
     _S("memory.stats", "Report how much experience the kernel has accumulated.",
        {"type": "object", "properties": {}, "required": []}, "builtin", RISK_READ, memory_stats),

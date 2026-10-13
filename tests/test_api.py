@@ -129,12 +129,13 @@ def test_health_and_state(server):
     base, runtime = server
     code, body = get(f"{base}/healthz")
     assert code == 200 and body["ok"] is True
-    assert body["kernel"]["gamma"] == 0.5
+    assert "kernel" not in body, "liveness must not leak kernel stats unauthenticated"
 
     code, state = get(f"{base}/api/state")
     assert code == 200
     assert "builtin" in state["tools"]["by_source"]
     assert state["tasks"] and "providers" in state
+    assert state["kernel"]["gamma"] == 0.5
 
 
 def test_tools_listing_and_expand(server):

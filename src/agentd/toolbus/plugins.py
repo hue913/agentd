@@ -14,7 +14,8 @@ from pathlib import Path
 from .spec import ToolSpec
 
 
-def load_plugin_dir(bus, directory: str | Path, namespace: str = "plugin") -> dict:
+def load_plugin_dir(bus, directory: str | Path, namespace: str = "plugin",
+                    allow_hashes: dict[str, str] | None = None) -> dict:
     directory = Path(directory).expanduser()
     report = {"loaded": [], "errors": {}, "skipped": []}
     if not directory.is_dir():
@@ -24,6 +25,16 @@ def load_plugin_dir(bus, directory: str | Path, namespace: str = "plugin") -> di
     for file in sorted(directory.glob("*.py")):
         if file.name.startswith("_"):
             continue
+        if allow_hashes:
+            import hashlib
+            digest = hashlib.sha256(file.read_bytes()).hexdigest()
+            expected = allow_hashes.get(file.name) or allow_hashes.get(file.stem)
+            if expected is None:
+                report["errors"][file.name] = "plugin is not in the allowlist (plugins_allow)"
+                continue
+            if expected.lower().lstrip("sha256:") != digest:
+                report["errors"][file.name] = "sha256 mismatch; refusing to import"
+                continue
         mod_name = f"agentd_plugin_{file.stem}"
         try:
             spec = importlib.util.spec_from_file_location(mod_name, file)

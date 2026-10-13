@@ -3,17 +3,14 @@
 //! The Rust side owns exactly two things, both of which the web console cannot
 //! do for itself:
 //!
-//! 1. The SSH tunnel. One `ssh -N -L` carries the API (8765), the PTY
-//!    WebSocket (8766) and noVNC (6080) back to loopback. The server exposes
+//! 1. The SSH tunnel. One `ssh -N -L` carries the API+PTY WebSocket (8765)
+//!    and noVNC (6080) back to loopback. The PTY stream is on the same port
+//!    as the HTTP API (`/api/pty/{id}/stream`); 8766 is a leftover local
+//!    forward that still works because it maps onto 8765. The server exposes
 //!    no public ports, so this tunnel *is* the security boundary.
-//! 2. The bridge credential handshake: the console asks the operator for the
-//!    agentd API token and the shell passes it to the bundled page, which keeps
-//!    it in webview storage for the session.
-//!
-//! NOTE: an earlier version of this comment claimed the token was kept in the OS
-//! keychain. It never was -- `keyring` is declared in Cargo.toml but was never
-//! called. Treat the token as webview-held: any XSS in the console can read it,
-//! which is why the console escapes every interpolation and ships a strict CSP.
+//! 2. The console holds the API token in webview session storage. There is
+//!    no OS keychain integration; treat XSS in the console as token theft,
+//!    which is why interpolations are escaped and a strict CSP ships with it.
 //!
 //! Everything else -- council, terminal, screen, ops, approvals -- is the same
 //! HTML the browser console runs, loaded from the bundled frontendDir. Two

@@ -64,7 +64,8 @@ def test_disabled_tool_is_hidden_and_refused(bus):
 def test_dangerous_tool_needs_approval(bus):
     ctx = CallContext(approved=False)
     result = bus.call("local.exec", {"command": "rm -rf /tmp/definitely-not-here"}, ctx)
-    assert not result.ok and "safety gate" in result.error
+    assert not result.ok
+    assert "safety gate" in result.error or "approval" in result.error.lower()
     # Approval is a property of the trusted call context -- the runtime sets it
     # only after a human answered /api/approve. It is not an argument.
     allowed = bus.call("local.exec", {"command": "rm -rf /tmp/definitely-not-here"},
@@ -99,7 +100,9 @@ def test_model_cannot_approve_its_own_command(bus, tmp_path):
     blocked_cmd = 'echo "dd of=/dev/sda1"'
     blocked = bus.call("local.exec", {"command": blocked_cmd, "approved": True}, CallContext())
     assert not blocked.ok
-    assert "safety gate" in bus.call("local.exec", {"command": blocked_cmd}, CallContext()).error
+    refused = bus.call("local.exec", {"command": blocked_cmd}, CallContext())
+    assert not refused.ok
+    assert "safety gate" in refused.error or "approval" in refused.error.lower()
 
     # 4. The trusted context still works, so human approval is not collateral damage.
     human = bus.call("local.exec", {"command": f"echo owned > {target}"}, CallContext(approved=True))
@@ -213,7 +216,9 @@ def test_skill_with_run_command_passes_gate(tmp_path, bus):
     )
     load_skill_dir(bus, tmp_path)
     result = bus.call("skill.wipe", {}, CallContext())
-    assert not result.ok and "safety gate" in result.error
+    assert not result.ok
+    err = (result.error or "").lower()
+    assert "safety gate" in err or "approval" in err or "confirm" in err
 
 
 # -- MCP ------------------------------------------------------------------
@@ -234,7 +239,7 @@ def test_mcp_handshake_discovery_and_call(bus):
         blocked = bus.call("mcp.fixture.drop_table", {"name": "users"}, CallContext())
         assert not blocked.ok
 
-        failing = bus.call("mcp.fixture.explode", {}, CallContext())
+        failing = bus.call("mcp.fixture.explode", {}, CallContext(approved=True))
         assert not failing.ok and "boom" in failing.output
     finally:
         server.stop()

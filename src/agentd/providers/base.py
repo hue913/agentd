@@ -93,8 +93,10 @@ class Provider(ABC):
     def choose(self, system: str, user: str, candidates: list[str]) -> Choice:
         """Score `candidates` for the state described in `user`."""
 
-    def text(self, prompt: str) -> tuple[str, Usage]:
-        """Free-text channel, used by the council's critique phase."""
+    def text(self, prompt: str, tools: list[dict] | None = None) -> tuple[str, Usage]:
+        """Free-text channel, used by propose/critique. `tools` is the native
+        function-calling catalog when the endpoint supports it; providers that
+        do not must ignore it rather than fail."""
         raise NotImplementedError(f"provider '{self.spec.label}' has no free-text channel")
 
     def health(self) -> dict:

@@ -108,7 +108,7 @@ class _NativeJSONProvider(Provider):
             notes="native protocol: no logprobs, scored via self-reported confidence",
         )
 
-    def text(self, prompt: str) -> tuple[str, Usage]:
+    def text(self, prompt: str, tools: list[dict] | None = None) -> tuple[str, Usage]:
         data = self._post(self._payload("", prompt, self.max_output_tokens, self.spec.temperature))
         return self._text_of(data), self._usage_of(data)
 

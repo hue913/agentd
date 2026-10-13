@@ -75,7 +75,7 @@ class OpenAICompatProvider(Provider):
         return h
 
     def _chat(self, messages: list[dict], *, want_logprobs: bool, max_tokens: int | None = None,
-              temperature: float | None = None) -> dict:
+              temperature: float | None = None, tools: list[dict] | None = None) -> dict:
         payload = {
             "model": self.spec.model,
             "messages": messages,
@@ -86,6 +86,8 @@ class OpenAICompatProvider(Provider):
         if want_logprobs:
             payload["logprobs"] = True
             payload["top_logprobs"] = 20
+        if tools:
+            payload["tools"] = tools
         return _post(f"{self.base}/chat/completions", payload, self._headers(), self.spec.timeout_s)
 
     @staticmethod
@@ -120,8 +122,9 @@ class OpenAICompatProvider(Provider):
         caps = probe_capabilities(self.spec)
         return caps.mode
 
-    def text(self, prompt: str) -> tuple[str, Usage]:
-        data = self._chat([{"role": "user", "content": prompt}], want_logprobs=False, max_tokens=600)
+    def text(self, prompt: str, tools: list[dict] | None = None) -> tuple[str, Usage]:
+        data = self._chat([{"role": "user", "content": prompt}], want_logprobs=False,
+                          max_tokens=600, tools=tools)
         content, _ = self._message(data)
         return content, self._usage(data)
 

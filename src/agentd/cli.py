@@ -209,7 +209,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     try:
         import uvicorn
     except ImportError:
-        print("pip install uvicorn", file=sys.stderr)
+        print("pip install 'agentd[api]'", file=sys.stderr)
         return 1
 
     runtime = Runtime(load_config(args.config))

@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,6 +20,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[api,dev]"
+      - name: Lint
+        run: python -m ruff check src tests
       - name: Tests
         # The suite starts a real uvicorn server on an ephemeral loopback port,
         # so it needs no services and no secrets.

@@ -18,10 +18,6 @@ from .toolbus.spec import RISK_DANGEROUS
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "agentd", "version": "0.1.0"}
 
-# Whether an MCP client may pre-approve its own tool calls. Off by default: the
-# client is an agent, and an agent that can approve itself defeats the gate.
-_MCP_PREAPPROVED = os.environ.get("AGENTD_MCP_PREAPPROVED") == "1"
-
 RESOURCES = {
     "agentd://memory": "The full experience pack as JSON (state, action, return).",
     "agentd://memory.md": "The same pack rendered as human-readable Markdown.",
@@ -77,7 +73,7 @@ def handle(message: dict, runtime, bus) -> dict | None:
                        "capabilities": {"tools": {"listChanged": False}, "resources": {}},
                        "serverInfo": SERVER_INFO,
                        "instructions": "agentd: memory-backed agent tools. Destructive actions "
-                                       "require approval=true and will be refused otherwise."})
+                                       "wait for a human in the console; clients cannot self-approve."})
     if method == "ping":
         return result({})
     if method == "tools/list":
@@ -99,11 +95,10 @@ def handle(message: dict, runtime, bus) -> dict | None:
         # the same self-grant the tool schemas were fixed to remove. Pre-approval
         # is therefore opt-in per deployment, and a rejected one is reported back
         # rather than silently dropped.
-        preapproved = bool(arguments.pop("approved", False))
-        approved = preapproved and _MCP_PREAPPROVED
+        arguments.pop("approved", None)  # never honour a self-grant from an MCP client
         from .toolbus import CallContext
 
-        ctx = CallContext(session="mcp", approved=approved, approver=None,
+        ctx = CallContext(session="mcp", approved=False, approver=getattr(runtime, "_ask_human", None),
                           ssh=runtime.ssh, kernel=runtime.kernel, audit=runtime.audit,
                           extra={"bus": bus})
         outcome = bus.call(name, arguments, ctx)
@@ -111,10 +106,10 @@ def handle(message: dict, runtime, bus) -> dict | None:
                    "isError": not outcome.ok}
         if outcome.error:
             payload["content"].append({"type": "text", "text": f"error: {outcome.error}"})
-        if preapproved and not approved:
+        if os.environ.get("AGENTD_MCP_PREAPPROVED") == "1":
             payload["content"].append({"type": "text", "text": (
-                "note: 'approved' was ignored — MCP pre-approval is disabled on this "
-                "deployment (set AGENTD_MCP_PREAPPROVED=1 to allow it)")})
+                "note: AGENTD_MCP_PREAPPROVED is ignored — MCP clients cannot "
+                "self-approve; dangerous tools go through the human gate")})
         return result(payload)
     if method in ("prompts/list",):
         return result({"prompts": []})

@@ -174,9 +174,8 @@ There are two shells over the same agentd runtime:
   in a browser over the SSH tunnel.
 * **The desktop client** (Tauri, in `desktop/`): it loads this same bundle, opens and supervises
   the SSH tunnel, and adds native window lifecycle. The API token stays in the console's
-  webview session storage — the shell does **not** put it in the OS keychain (`keyring` is
-  declared in Cargo.toml but never called), so hold the console to the same bar as the
-  browser UI: every interpolation is escaped and a strict CSP ships with it.
+  webview session storage — there is no OS keychain integration, so hold the console
+  to the same bar as the browser UI: every interpolation is escaped and a strict CSP ships with it.
 
 Desktop builds: macOS universal (Intel + Apple Silicon) and Windows. Windows builds run via
 GitHub Actions — Tauri cannot cross-compile a Windows bundle from a Mac.
@@ -302,9 +301,8 @@ flowchart LR
         D[Tauri desktop<br/>Intel · Apple Silicon · Windows]
     end
     subgraph tunnel [One SSH tunnel — the whole security model]
-        T1[8765 API + SSE]:::p
-        T2[8766 PTY WebSocket]:::p
-        T3[6080 noVNC]:::p
+        T1[8765 API + SSE + PTY WS]:::p
+        T2[6080 noVNC]:::p
     end
     subgraph agentd [agentd · 127.0.0.1 only]
         API[FastAPI + bearer token]
@@ -319,7 +317,7 @@ flowchart LR
         SSH1[Your servers<br/>via system ssh]
         SCR[Xvfb screen<br/>x11vnc]
     end
-    B & D --> T1 & T2 & T3 --> API --> LOOP
+    B & D --> T1 & T2 --> API --> LOOP
     LOOP --> KERNEL & COUNCIL & PROV
     LOOP --> BUS --> GATE --> SSH1
     API --> SCR
@@ -341,7 +339,7 @@ src/agentd/
   screen/      capture · change detection · perception · gated synthetic input
   sysinfo/     ops panel metrics (no request data ever reaches a shell)
 ui/            the console, served same-origin by agentd
-tests/         380 tests (15 platform skips); platform-specific ones skip with a stated reason
+tests/         389 tests (19 platform skips); platform-specific ones skip with a stated reason
 ```
 
 ## Deploy to a small VPS

@@ -110,7 +110,9 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "ts": time.time(), "kernel": rt.kernel.stats()}
+        # Liveness only. Kernel stats used to leak episode counts to anyone
+        # who could hit loopback (or an SSH tunnel) without a token.
+        return {"ok": True, "ts": time.time()}
 
     @app.get("/api/state")
     def state():
@@ -232,8 +234,9 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
                 record.update({"status": "ready", "success": False, "steps": steps,
                                "screenshot": str(Path(rt.db_path).parent / "browser-runs" / f"{run_id}.png")})
                 rt.store.add_trajectory_event(run_id, "observation", "initial page captured", f"{run_id}.png")
-            except Exception as exc:
-                record.update({"status": "error", "error": _short_reason(exc)})
+            except Exception as extra:
+                from ..runtime import _short_reason
+                record.update({"status": "error", "error": _short_reason(extra)})
                 rt.store.add_trajectory_event(run_id, "reflection", record["error"])
         asyncio.create_task(execute())
         return record
@@ -361,8 +364,11 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
 
         try:
             # subprocess under the hood (up to 60s): must leave the event loop.
+            # `approved` is never taken from the client. A holder of the API
+            # token (or a stolen one) used to self-grant block-level commands
+            # with {"approved": true}. The only grant path is /api/approve.
             result = await asyncio.to_thread(
-                rt.ssh.exec, host, command, approved=bool(body.get("approved")),
+                rt.ssh.exec, host, command, approved=False,
                 session=body.get("session"))
         except ApprovalRequired as exc:
             return JSONResponse({"blocked": True, "reason": str(exc)}, status_code=202)
@@ -521,6 +527,7 @@ def create_app(runtime: Runtime | None = None) -> "FastAPI":
     ops.STATE["screen"] = rt.screen
     ops.STATE["screen_actions"] = rt.screen_actions
     ops.STATE["token"] = server_token()
+    ops.STATE["runtime"] = rt
     app.include_router(ops.router)
 
     # The console is served from the same origin as the API on purpose: the PTY

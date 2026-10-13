@@ -117,7 +117,7 @@ class StepOutcome:
     decision: object
     observation: object
     done: bool
-    reward: float
+    reward: float | None
     council_outcome: object | None = None
 
 
@@ -264,7 +264,17 @@ class AgentLoop:
 
             decision = outcome.decision
             if outcome.done:
-                recorded_reward = outcome.reward if outcome.reward > 0 else self.config.failure_penalty
+                if outcome.reward is None:
+                    # Unverified terminal (ops `finish`): end the episode
+                    # without teaching the kernel that finishing is success
+                    # or that the last action is a failure. Distinct from a
+                    # scripted task that ends with reward 0 (a real miss),
+                    # which still takes the failure penalty.
+                    recorded_reward = 0.0
+                elif outcome.reward > 0:
+                    recorded_reward = outcome.reward
+                else:
+                    recorded_reward = self.config.failure_penalty
             else:
                 recorded_reward = -self.config.step_cost
             recorder.record(outcome.trace.state, decision.chosen_action,
@@ -284,7 +294,11 @@ class AgentLoop:
 
             state = outcome.observation if isinstance(outcome.observation, str) else outcome.trace.state
             if outcome.done:
-                report.success, report.score = outcome.reward > 0, float(outcome.reward)
+                if outcome.reward is None:
+                    report.success, report.score = False, 0.0
+                    report.stopped_by = "unverified finish (no reward recorded)"
+                else:
+                    report.success, report.score = outcome.reward > 0, float(outcome.reward)
                 report.final = str(outcome.observation)[:2000]
                 break
         else:
@@ -332,13 +346,14 @@ class _Noop:
     used = False
 
 
-def _unpack_apply(result) -> tuple[object, bool, float]:
+def _unpack_apply(result) -> tuple[object, bool, float | None]:
     if isinstance(result, tuple) and len(result) == 3:
         return result
     ok = bool(getattr(result, "ok", True))
     state = getattr(result, "output", None) or str(result)
     done = bool(getattr(result, "done", False))
-    reward = float(getattr(result, "reward", 0.0) or 0.0)
+    raw = getattr(result, "reward", 0.0)
+    reward: float | None = None if raw is None else float(raw or 0.0)
     return state, done, reward if ok else 0.0
 
 

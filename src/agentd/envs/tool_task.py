@@ -125,7 +125,7 @@ class ToolTask:
         # AgentLoop.enumerate_candidates asks the model to propose options.
         return []
 
-    def apply(self, action: str, ctx=None) -> tuple[str, bool, float]:
+    def apply(self, action: str, ctx=None) -> tuple[str, bool, float | None]:
         self._steps += 1
         try:
             kind, name, args = parse_action(action)
@@ -138,7 +138,11 @@ class ToolTask:
             answer = str(args.get("answer", "")).strip()
             self._state = (f"[{self._steps}] finish after {self._steps - 1} tool call(s).\n"
                            f"Answer: {answer}")
-            return self._state, True, 1.0
+            # Ending the episode is not evidence the goal was met. A +1 here
+            # taught the kernel "call finish immediately". `None` is the
+            # unverified-terminal sentinel (distinct from a scripted task
+            # that ends with reward 0, which is a real failure).
+            return self._state, True, None
 
         bus = (getattr(ctx, "extra", {}) or {}).get("bus") if ctx is not None else None
         if bus is None:

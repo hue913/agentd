@@ -280,8 +280,11 @@ class PTYHub:
             self._audit(AuditRecord(host=label, command=f"[pty] {purpose}", level="block",
                                     reasons=verdict.reasons, error="blocked at session admission"))
             raise PTYRefused("; ".join(verdict.reasons) or "purpose blocked by safety gate")
-        session = PTYSession(self.hub, label, rows=rows, cols=cols, purpose=purpose,
-                             idle_ttl=self.idle_ttl)
+        try:
+            session = PTYSession(self.hub, label, rows=rows, cols=cols, purpose=purpose,
+                                 idle_ttl=self.idle_ttl)
+        except OSError as exc:
+            raise PTYError(f"could not open a PTY: {exc}") from exc
         self.sessions[session.id] = session
         self._audit(AuditRecord(host=label, command=f"[pty-open] {purpose}", level="allow",
                                 reasons=verdict.reasons if verdict else [],

@@ -162,7 +162,7 @@ POST /api/session
   浏览器里打开即可。
 * **桌面客户端**（Tauri，位于 `desktop/`）：加载同一份 bundle，负责打开并守护 SSH 隧道，
   并管理原生窗口生命周期。API token 由控制台在 webview 会话存储里持有——桌面端**没有**把它
-  放进系统钥匙串（`keyring` 依赖被声明但从未调用），所以请按「控制台同源」的安全假设看待：
+  放进系统钥匙串，所以请按「控制台同源」的安全假设看待：
   控制台对所有插值做了转义并带严格 CSP。
 
 桌面客户端的构建目标：macOS 通用包（英特尔 + M 系列）与 Windows。Windows 包走 GitHub
@@ -276,9 +276,8 @@ flowchart LR
         D[Tauri 桌面端<br/>英特尔 · M 系列 · Windows]
     end
     subgraph tunnel [一条 SSH 隧道 — 这就是全部的安全模型]
-        T1[8765 API + SSE]:::p
-        T2[8766 PTY WebSocket]:::p
-        T3[6080 noVNC]:::p
+        T1[8765 API + SSE + PTY WS]:::p
+        T2[6080 noVNC]:::p
     end
     subgraph agentd [agentd · 只绑 127.0.0.1]
         API[FastAPI + Bearer 鉴权]
@@ -293,7 +292,7 @@ flowchart LR
         SSH1[你的服务器<br/>经由系统 ssh]
         SCR[Xvfb 屏幕<br/>x11vnc]
     end
-    B & D --> T1 & T2 & T3 --> API --> LOOP
+    B & D --> T1 & T2 --> API --> LOOP
     LOOP --> KERNEL & COUNCIL & PROV
     LOOP --> BUS --> GATE --> SSH1
     API --> SCR
@@ -315,7 +314,7 @@ src/agentd/
   screen/       抓帧 · 变化检测 · 感知 · 有门的合成输入
   sysinfo/      运维面板指标（请求数据永远不会碰到 shell）
 ui/            控制台——由 agentd 同源托管
-tests/         380 个测试（15 个按平台跳过）；平台相关的用例带着原因跳过，绝不假装通过
+tests/         389 个测试（19 个按平台跳过）；平台相关的用例带着原因跳过，绝不假装通过
 ```
 
 ## 部署到一台小 VPS

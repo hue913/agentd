@@ -22,7 +22,7 @@ import time
 import pytest
 
 from agentd import sysinfo
-from agentd.envs.pty_env import _Ring, PTYHub, PTYRefused, PTYSession
+from agentd.envs.pty_env import _Ring, PTYError, PTYHub, PTYRefused, PTYSession
 from agentd.envs.ssh_env import HostSpec, SSHHub
 from agentd.safety.audit import AuditLog
 
@@ -111,7 +111,10 @@ def _read_audit(audit):
 @pytest.mark.parametrize("rows,cols", [(30, 100), (4, 20), (999, 9999)])
 def test_geometry_is_clamped_to_something_a_terminal_accepts(hub, rows, cols):
     pty_hub, _, _ = hub
-    session = pty_hub.open("self", purpose="geometry check", rows=rows, cols=cols)
+    try:
+        session = pty_hub.open("self", purpose="geometry check", rows=rows, cols=cols)
+    except (OSError, PTYError) as extra:
+        pytest.skip(f"no PTY available: {extra}")
     try:
         assert 4 <= session.rows <= 500
         assert 20 <= session.cols <= 1000
@@ -156,7 +159,10 @@ def test_digest_carries_no_typed_bytes(hub):
 
 def test_closing_a_session_stops_the_child(hub):
     pty_hub, _, _ = hub
-    session = pty_hub.open("self", purpose="lifecycle check")
+    try:
+        session = pty_hub.open("self", purpose="lifecycle check")
+    except (OSError, PTYError) as extra:
+        pytest.skip(f"no PTY available: {extra}")
     pid = session.proc.pid
     pty_hub.close(session.id)
     time.sleep(0.6)

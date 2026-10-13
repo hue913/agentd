@@ -65,6 +65,7 @@ def test_roundtrip_through_disk(trained_store, tmp_path):
 
     report = import_pack(Store(), load_pack(tmp_path / "bad.agentdmem"))
     assert any("checksum mismatch" in w for w in report["warnings"])
+    assert report["steps_added"] == 0, "a tampered pack must not enter memory"
 
 
 def test_import_rebuilds_an_equivalent_memory(trained_store):
@@ -135,3 +136,4 @@ def test_forged_checksum_flag_is_ignored(trained_store):
     report = import_pack(Store(), pack)
     assert report["checksum_ok"] is False
     assert any("checksum mismatch" in w for w in report["warnings"])
+    assert report["steps_added"] == 0

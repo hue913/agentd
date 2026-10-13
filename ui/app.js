@@ -53,7 +53,7 @@
     } finally {
       clearTimeout(timer);
     }
-    if (!res.ok) {
+    if (!res.ok && res.status !== 202) {
       let detail = `${res.status}`;
       try { detail = (await res.json()).detail || detail; } catch (_) {}
       const err = new Error(detail);
@@ -379,8 +379,9 @@
     const tok = rep.tokens || {};
 
     $("cost-box").hidden = false;
+    const cache = tok.cache_hit_pct != null ? ` · cache ${tok.cache_hit_pct}%` : "";
     $("cost-total").textContent = tok.total_tokens
-      ? `${tok.total_tokens.toLocaleString()} tok${tok.est_usd ? ` · $${(+tok.est_usd).toFixed(4)}` : ""}`
+      ? `${tok.total_tokens.toLocaleString()} tok${tok.est_usd ? ` · $${(+tok.est_usd).toFixed(4)}` : ""}${cache}`
       : "—";
 
     // 最终答案（工具任务收尾时给的那段话）
@@ -660,17 +661,25 @@
   async function openPty() {
     const host = $("pty-host").value;
     if (!host) return toast("没有可用主机", "bad");
+    $("pty-state").textContent = "等待审批…";
     try {
       const s = await api("api/pty/open", {
         method: "POST",
         body: JSON.stringify({ host, purpose: $("pty-purpose").value.trim(), rows: 30, cols: 100 }),
+        timeoutMs: 480000,
       });
+      if (s && s.blocked) {
+        $("pty-state").textContent = "未打开";
+        toast("终端未打开：" + (s.reason || "未获批"), "bad");
+        return;
+      }
       state.pty = s.session;
       $("pty-state").textContent = `${s.session} · ${s.host}`;
       $("term-empty").hidden = true;
       connectPty();
       toast("已打开终端");
     } catch (e) {
+      $("pty-state").textContent = "未打开";
       toast("打开失败：" + e.message, "bad");
     }
   }

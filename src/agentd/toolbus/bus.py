@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import inspect
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
 from .spec import RISK_DANGEROUS, ToolResult, ToolSpec, validate_args
@@ -131,8 +131,12 @@ class ToolBus:
                 return ToolResult(
                     ok=False, risk=spec.risk,
                     error=(f"tool '{name}' is {spec.risk} and needs human approval before running; "
-                           f"re-request it with approval=true once the user confirms"),
+                           "the operator must confirm it in the console"),
                 )
+            # Grant this invocation only. The loop reuses one CallContext for
+            # the whole episode; mutating ctx.approved in place would let every
+            # later tool ride the same human click.
+            ctx = replace(ctx, approved=True)
 
         t0 = time.time()
         kwargs = dict(clean)

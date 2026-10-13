@@ -143,7 +143,10 @@ def import_pack(store: Store, pack: dict, *, skip_tasks: list[str] | None = None
     report = {"episodes_added": 0, "episodes_skipped": 0, "steps_added": 0, "steps_skipped": 0,
               "tasks_skipped": [], "warnings": [], "checksum_ok": verify_pack(pack)}
     if not report["checksum_ok"]:
-        report["warnings"].append("checksum mismatch: the file was edited or truncated after export")
+        report["warnings"].append(
+            "checksum mismatch: the file was edited or truncated after export; "
+            "refusing to import untrusted steps")
+        return report
 
     if current_source and pack.get("source"):
         for key in ("model", "host"):

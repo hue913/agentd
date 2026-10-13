@@ -25,6 +25,7 @@ import contextlib
 import time
 
 from fastapi import APIRouter, Body, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .. import sysinfo
@@ -59,18 +60,33 @@ class OpenBody(BaseModel):
     purpose: str = ""
     rows: int = 24
     cols: int = 80
-    approved: bool = False
 
 
 @router.post("/api/pty/open")
 async def pty_open(body: OpenBody):
+    # An interactive PTY is a root shell the gate cannot inspect keystroke by
+    # keystroke. Opening one always needs a human, and the client cannot
+    # self-grant with an `approved` field.
+    runtime = STATE.get("runtime")
+    payload = {
+        "tool": "pty.open", "host": body.host, "purpose": body.purpose or "(none)",
+        "risk": "interactive shell — keystrokes are not gated",
+    }
+    granted = True
+    if runtime is not None and hasattr(runtime, "_ask_human"):
+        granted = bool(await asyncio.to_thread(runtime._ask_human, payload))
+    if not granted:
+        return JSONResponse(
+            {"blocked": True, "reason": "opening an interactive PTY was not approved"},
+            status_code=202,
+        )
     try:
         session = _hub().open(body.host, purpose=body.purpose, rows=body.rows,
-                              cols=body.cols, approved=body.approved)
-    except PTYRefused as exc:
-        raise HTTPException(403, str(exc))
-    except PTYError as exc:
-        raise HTTPException(400, str(exc))
+                              cols=body.cols, approved=True)
+    except PTYRefused as extra:
+        raise HTTPException(403, str(extra))
+    except PTYError as extra:
+        raise HTTPException(400, str(extra))
     return {**session.digest(), "alive": session.alive}
 
 

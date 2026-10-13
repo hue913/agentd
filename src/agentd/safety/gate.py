@@ -17,6 +17,7 @@ LEVEL_BLOCK = "block"
 # (pattern, level, reason). Ordered: first match of the highest severity wins.
 RULES: list[tuple[str, str, str]] = [
     (r"\brm\s+(-[a-z]*[rf][a-z]*\s+)+", "block", "recursive/forced file deletion"),
+    (r"\brm\b[^\n]*(?:--recursive|--force)\b", "block", "recursive/forced file deletion"),
     (r"\bmkfs(\.\w+)?\b", "block", "filesystem format"),
     (r"\bdd\b[^\n]*\bof=/dev/", "block", "raw write to a block device"),
     (r">(?:\s*)/dev/(?:sd|nvme|disk|hd)", "block", "redirect onto a disk device"),
@@ -37,6 +38,10 @@ RULES: list[tuple[str, str, str]] = [
     # proves nothing, so a human reads the code before it runs.
     (r"\b(?:python|python\d(?:\.\d+)*|pypy\d*|perl|ruby|php)\b[^|;&\n]*\s-[cC]\b",
      "confirm", "interpreter runs inline code"),
+    (r"\b(?:python|python\d(?:\.\d+)*|pypy\d*|perl|ruby|php)\b\s+\S+\.(?:py|pl|rb|php)\b",
+     "confirm", "interpreter runs a script file"),
+    (r"\b(?:bash|sh|zsh|ksh|dash)\b[^|;&\n]*\s-[ic]\b",
+     "confirm", "shell runs inline code"),
     (r"\b(?:node|nodejs|deno|bun)\b[^|;&\n]*\s-(?:e|eval|p)\b",
      "confirm", "JS runtime evaluates inline code"),
     (r"\bawk\b[^|;&\n]*(?:\bsystem\s*\(|\bgetline\b)",
@@ -45,7 +50,7 @@ RULES: list[tuple[str, str, str]] = [
     # and even that stays behind a confirm because the flag is one typo away
     (r"\b(?:fdisk|sfdisk|cfdisk|gdisk|parted|partprobe)\b",
      "confirm", "partition table tool"),
-    (r"\bchmod\s+-[Rr]\s+0?777\b", "confirm", "world-writable permissions"),
+    (r"\bchmod\b[^\n]*\b0?777\b", "confirm", "world-writable permissions"),
     (r"\b(?:apt|apt-get|dnf|yum|pacman|brew)\s+(?:remove|purge|uninstall)\b", "confirm", "package removal"),
     (r"\bsystemctl\s+(?:stop|disable|mask|restart|kill)\b", "confirm", "service state change"),
     (r"\bkill(?:all)?\s+-9\b", "confirm", "forced process kill"),

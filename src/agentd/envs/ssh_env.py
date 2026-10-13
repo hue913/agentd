@@ -71,7 +71,7 @@ class ApprovalRequired(SSHError):
         super().__init__(
             f"approval required on '{host}' "
             f"({', '.join(verdict.reasons) or 'not provably read-only'}):\n  {command}\n"
-            "re-run with approved=True only after a human confirms"
+            "confirm it in the console, then retry the same command"
         )
 
 

@@ -66,7 +66,10 @@ def load_skill_file(path: Path) -> Skill:
         when=str(meta.get("when") or ""),
         run=str(meta.get("run") or ""),
         args=list(meta.get("args") or []),
-        risk=str(meta.get("risk") or (RISK_WRITE if meta.get("run") else RISK_READ)),
+        # Authors do not get to pick their own risk. A skill that runs a
+        # command is at least a write; the gate still classifies the rendered
+        # command at call time.
+        risk=RISK_WRITE if meta.get("run") else RISK_READ,
         body=body,
         path=path,
     )
@@ -92,15 +95,19 @@ def _make_handler(skill: Skill):
         # A skill pack is third-party code: same gate as any other shell tool.
         verdict = classify(rendered)
         human_ok = bool(ctx and ctx.approved)
-        if verdict.hard_blocked and not human_ok:
-            return ToolResult(ok=False, risk=RISK_DANGEROUS,
-                              error=f"skill '{skill.name}' refused by safety gate: {'; '.join(verdict.reasons)}")
-        if not human_ok and not initial_readonly(rendered):
-            return ToolResult(
-                ok=False, risk=RISK_WRITE,
-                error=(f"skill '{skill.name}' runs a non-read-only command ({rendered[:120]}); "
-                       "requires the operator to approve it before it can run"),
-            )
+        if not human_ok and (verdict.hard_blocked or not initial_readonly(rendered)):
+            granted = bool(ctx and ctx.approver and ctx.approver({
+                "tool": f"skill.{skill.name}", "command": rendered,
+                "risk": RISK_DANGEROUS if verdict.hard_blocked else RISK_WRITE,
+                **verdict.as_dict(),
+            }))
+            if not granted:
+                return ToolResult(
+                    ok=False, risk=RISK_DANGEROUS if verdict.hard_blocked else RISK_WRITE,
+                    error=(f"skill '{skill.name}' runs a non-read-only command ({rendered[:120]}); "
+                           "the operator must confirm it in the console"),
+                )
+            human_ok = True
         try:
             proc = subprocess.run(rendered, shell=True, capture_output=True, text=True, timeout=180)
         except subprocess.TimeoutExpired:

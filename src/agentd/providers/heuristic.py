@@ -100,5 +100,5 @@ class HeuristicModel(Provider):
                       usage=Usage(prompt_tokens=len(user) // 4, completion_tokens=2),
                       notes="heuristic lexical policy")
 
-    def text(self, prompt: str) -> tuple[str, Usage]:
+    def text(self, prompt: str, tools: list[dict] | None = None) -> tuple[str, Usage]:
         return '{"objections": []}', Usage(prompt_tokens=len(prompt) // 4, completion_tokens=8)

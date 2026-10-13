@@ -394,7 +394,8 @@ class Runtime:
         report = {"plugins": {}, "skills": {}, "mcp": {}}
         plugins_dir = self.config.get("plugins_dir")
         if plugins_dir:
-            report["plugins"] = load_plugin_dir(self.bus, plugins_dir)
+            allow = self.config.get("plugins_allow") or None
+            report["plugins"] = load_plugin_dir(self.bus, plugins_dir, allow_hashes=allow)
         skills_dir = self.config.get("skills_dir")
         if skills_dir:
             report["skills"] = load_skill_dir(self.bus, skills_dir)
@@ -617,7 +618,10 @@ class Runtime:
 
     def decision_model(self) -> dict:
         value = self.config.get("decision_model")
-        return dict(value) if isinstance(value, dict) else {"enabled": False, "provider": "jev", "fallback": "council"}
+        out = dict(value) if isinstance(value, dict) else {"enabled": False, "provider": "jev", "fallback": "council"}
+        out["used_by_loop"] = False
+        out["note"] = "stored only; the agent loop does not consult this yet"
+        return out
 
     def save_decision_model(self, body: dict) -> dict:
         if not isinstance(body, dict):

@@ -111,12 +111,19 @@ class Council:
         return {k: v / total for k, v in finite.items()}
 
     # -- phase 1: independent drafting ------------------------------------
-    def _draft(self, system: str, user: str, candidates: list[str]) -> tuple[list[Proposal], Usage]:
+    def _draft(self, system: str, user: str, candidates: list[str],
+               primary_choice=None) -> tuple[list[Proposal], Usage]:
         proposals: list[Proposal] = []
         usage = Usage(calls=0)
-        for member in self.members[: max(self.trigger.max_members, 1)]:
+        members = self.members[: max(self.trigger.max_members, 1)]
+        for i, member in enumerate(members):
+            reused = False
             try:
-                choice = member.choose(system, user, candidates)
+                if i == 0 and primary_choice is not None:
+                    choice = primary_choice
+                    reused = True
+                else:
+                    choice = member.choose(system, user, candidates)
             except Exception as exc:
                 # A member without a key, or with a dead endpoint, abstains --
                 # it must not take the whole deliberation down. "Not configured
@@ -127,7 +134,8 @@ class Council:
                     reasoning=f"unavailable: {type(exc).__name__}: {exc}"[:200],
                     mode="unavailable"))
                 continue
-            usage = usage + choice.usage
+            if not reused:
+                usage = usage + choice.usage
             probs = self._probabilities(choice.z)
             top = max(probs, key=probs.get) if probs else candidates[0]
             proposals.append(Proposal(member=member.label, action=top, scores=probs,
@@ -184,7 +192,9 @@ class Council:
                                   usage=first.usage, weights={primary.label: 1.0},
                                   scope=scope, task=task)
 
-        proposals, usage = self._draft(system or state, user or state, candidates)
+        proposals, usage = self._draft(system or state, user or state, candidates,
+                                       primary_choice=first)
+        usage = first.usage + usage
         usable = [p for p in proposals if p.scores]
         objections, usage2 = self._critique(state, usable)
         usage = usage + usage2
