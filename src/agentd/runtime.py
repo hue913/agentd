@@ -417,6 +417,14 @@ class Runtime:
         from the HTTP handler thread; the event loop never blocks.
         """
         if os.environ.get("AGENTD_AUTO_APPROVE") == "1":
+            # Deployments are supposed to strip this from the service environment
+            # (deploy/install_server.sh sets UnsetEnvironment=). Finding it set on
+            # a server means the human gate is off, so say so loudly and mark the
+            # audit record -- an auto-granted command must never be
+            # indistinguishable from one a person approved.
+            log.critical("AGENTD_AUTO_APPROVE=1 is set: every pending approval is "
+                         "being granted automatically. Do not run this on a real host.")
+            payload = {**payload, "approved_by": "auto-env", "auto": True}
             self.publish({"type": "approval", "auto": True, **payload})
             return True
         token = uuid.uuid4().hex[:12]

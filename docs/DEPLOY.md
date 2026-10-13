@@ -15,7 +15,8 @@ The script installs `uv` + CPython 3.11 (no system Python upgrade needed), creat
 break more often than they work), writes `/var/lib/agentd/agentd.json` (`0600`), runs
 `agentd doctor`, runs the keyless demo, and installs a systemd unit.
 
-Verified on the target: `agentd doctor` → ready, **151 tests pass**, and
+Verified on the target: `agentd doctor` → ready, **151 tests pass** (the suite has since
+grown to 380 passing, 15 skipped — see the repo README for the current number), and
 `agentd bench --episodes 40` reproduced the laptop's numbers **exactly**
 (control 1/40, learning 11/40) — the measurement is seed-deterministic, not machine-dependent.
 

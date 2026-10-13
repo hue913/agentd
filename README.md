@@ -52,12 +52,20 @@ agentd bench --episodes 40      # success rate with and without memory
 You will see two lines:
 
 ```
-learning OFF (control)   1/40 (  2.5%)    1st half  5.0%   2nd half  0.0%
-learning ON  (JitRL)    11/40 ( 27.5%)    1st half  0.0%   2nd half 55.0%
+memory OFF (control)   successes  1/40   first half 0.05   second half 0.00
+memory ON  (JitRL)     successes 27/40   first half 0.55   second half 0.80
 ```
 
-How to read it: without memory, the control arm wins 1 of 40 episodes. With memory, 11 —
-and the second-half success rate climbs. That is the memory working. For results beyond a
+How to read it: without memory, the control arm wins 1 of 40 episodes. With memory, 27 — and
+the second-half success rate climbs. That is the memory working. `agentd bench` runs the same
+mechanism over different tasks and prints a different shape:
+
+```
+learning OFF (control)     1/40 (  2.5%)   1st half   5.0%   2nd half   0.0%
+learning ON  (JitRL)      21/40 ( 52.5%)   1st half  20.0%   2nd half  85.0%
+```
+
+For results beyond a
 single seed, see [Measured results](#measured-results).
 
 ## What it can do
@@ -165,7 +173,10 @@ There are two shells over the same agentd runtime:
 * **The browser console**: a single no-build bundle served by agentd itself at `/`. Open it
   in a browser over the SSH tunnel.
 * **The desktop client** (Tauri, in `desktop/`): it loads this same bundle, opens and supervises
-  the SSH tunnel, stores bridge credentials in the OS keychain, and adds native window lifecycle.
+  the SSH tunnel, and adds native window lifecycle. The API token stays in the console's
+  webview session storage — the shell does **not** put it in the OS keychain (`keyring` is
+  declared in Cargo.toml but never called), so hold the console to the same bar as the
+  browser UI: every interpolation is escaped and a strict CSP ships with it.
 
 Desktop builds: macOS universal (Intel + Apple Silicon) and Windows. Windows builds run via
 GitHub Actions — Tauri cannot cross-compile a Windows bundle from a Mac.
@@ -202,25 +213,30 @@ the numbers, so the baseline and a real model never get mixed up.
 
 | suite | policy | scale | memory OFF | memory ON | delta |
 |---|---|---|---|---|---|
-| ops (scripted chains) | synthetic noisy model | 40 eps × 12 seeds | mean 1.1/40 | mean 14.4/40 | better in 11/12 seeds |
-| ops, default seed | same | 40 eps | 1/40 (2.5%) | 11/40 (27.5%) | 2nd half 55% |
+| ops (scripted chains) | synthetic noisy model | 40 eps × 12 seeds | mean 1.1/40 | mean 24.8/40 | better in 12/12 seeds |
+| ops, default seed (seed 7) | same | 40 eps | 1/40 (2.5%) | 21/40 (52.5%) | 2nd half 85% |
 | web (real Chromium) | lexical baseline (not an LLM) | 60 eps × 3 seeds | mean 18.7/60 | mean 23.7/60 | **+0.08, one seed negative** |
 
-Reproduce the ops suite seed by seed:
+Reproduce the ops suite seed by seed — the table below is that command's output:
 
 ```bash
 for s in $(seq 1 12); do agentd bench --episodes 40 --seed $s | sed -n 3,4p; done
 ```
 
+| seed | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| OFF | 0 | 0 | 2 | 2 | 2 | 0 | 1 | 1 | 0 | 1 | 3 | 1 |
+| ON | 27 | 25 | 28 | 27 | 25 | 22 | 21 | 23 | 23 | 24 | 27 | 25 |
+
 Three notes for reading the tables:
 
-* The ops suite varies a lot across seeds (0 to 30). Read the trend: learning is better in
-  11 of 12 seeds, and the twelfth is a tie where neither arm ever succeeds.
+* The ops suite varies across seeds (OFF 0 to 3, ON 21 to 28). Read the trend: learning is
+  better in 12 of 12 seeds.
 * The web suite drives actual Chromium through Playwright over six MiniWoB-shaped tasks
   (numbered elements, one goal, reward decided by a DOM checker on the page). Its gains are
   modest and seed-dependent; why, see [Honest limits](#honest-limits).
 * Cross-machine reproducibility: a 2 vCPU Xeon deployment server (Ubuntu) reproduces the
-  laptop's seed-7 numbers exactly (1/40 vs 11/40). The measurement is seed-deterministic,
+  laptop's seed-7 numbers exactly (1/40 vs 21/40). The measurement is seed-deterministic,
   not machine-dependent.
 
 **Deliberately not measured here:** full WebArena. The official shape is 4 vCPU / 16 GB /
@@ -325,7 +341,7 @@ src/agentd/
   screen/      capture · change detection · perception · gated synthetic input
   sysinfo/     ops panel metrics (no request data ever reaches a shell)
 ui/            the console, served same-origin by agentd
-tests/         ~300 tests; platform-specific ones skip with a stated reason
+tests/         380 tests (15 platform skips); platform-specific ones skip with a stated reason
 ```
 
 ## Deploy to a small VPS
@@ -336,9 +352,12 @@ tests/         ~300 tests; platform-specific ones skip with a stated reason
 bash deploy/install_server.sh /path/to/agentd
 ```
 
-The unit runs `agentd serve --host 127.0.0.1` and caps memory. It also drops
-`AGENTD_AUTO_APPROVE` from the environment on purpose: the lab-only auto-approve switch can
-never reach a deployed service. The full worked example — including the mistake (a briefly
+The unit runs `agentd serve --host 127.0.0.1` and caps memory. It also sets
+`UnsetEnvironment=AGENTD_AUTO_APPROVE`, so the lab-only auto-approve switch cannot reach a
+deployed service even if an operator exported it in a shell, `/etc/environment`, or a PAM
+profile. Belt and braces: if the variable is present anyway, the runtime logs a `CRITICAL`
+line and marks the audit record `approved_by=auto-env`, so an auto-granted command is never
+indistinguishable from one a person approved. The full worked example — including the mistake (a briefly
 public noVNC port, and the status check that now fails loudly instead of staying quiet) —
 is in [`docs/DEPLOY.md`](docs/DEPLOY.md).
 

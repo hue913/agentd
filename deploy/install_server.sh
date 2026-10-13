@@ -91,6 +91,9 @@ MemoryMax=512M
 NoNewPrivileges=true
 ProtectSystem=full
 ReadWritePaths=$DATA_DIR
+# The lab-only auto-approve switch must never reach the service, even if an
+# operator exported it in a shell, /etc/environment, or a PAM profile.
+UnsetEnvironment=AGENTD_AUTO_APPROVE
 
 [Install]
 WantedBy=multi-user.target

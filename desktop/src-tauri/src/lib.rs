@@ -6,8 +6,14 @@
 //! 1. The SSH tunnel. One `ssh -N -L` carries the API (8765), the PTY
 //!    WebSocket (8766) and noVNC (6080) back to loopback. The server exposes
 //!    no public ports, so this tunnel *is* the security boundary.
-//! 2. The bearer token, kept in the OS keychain rather than in the webview's
-//!    storage where any XSS could read it.
+//! 2. The bridge credential handshake: the console asks the operator for the
+//!    agentd API token and the shell passes it to the bundled page, which keeps
+//!    it in webview storage for the session.
+//!
+//! NOTE: an earlier version of this comment claimed the token was kept in the OS
+//! keychain. It never was -- `keyring` is declared in Cargo.toml but was never
+//! called. Treat the token as webview-held: any XSS in the console can read it,
+//! which is why the console escapes every interpolation and ships a strict CSP.
 //!
 //! Everything else -- council, terminal, screen, ops, approvals -- is the same
 //! HTML the browser console runs, loaded from the bundled frontendDir. Two
