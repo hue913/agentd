@@ -86,9 +86,14 @@ def run_task(kernel: JitRLKernel, model: Provider, task_name: str) -> bool:
                                  mode="token")
         chosen = decision.chosen_action
         success_step = chosen == step["right"]
+        # Every step that advances the task earns its reward, not just the last
+        # one. Rewarding only the terminal step recorded each correct intermediate
+        # move as a failure, so those states only ever collected a return of 0 and
+        # the kernel had nothing to bias them with -- the learning arm came out at
+        # 0/40 while the same mechanism under `agentd bench` reached 21/40.
         rec.record(step["state"], chosen, z=decision.rerank.chosen.z, adv=decision.rerank.chosen.advantage,
                    z_prime=decision.rerank.chosen.z_prime, chosen_index=decision.rerank.chosen_index,
-                   reward=1.0 if (success_step and i == len(task["steps"]) - 1) else 0.0)
+                   reward=1.0 if success_step else 0.0)
         if not success_step:
             rec.finish(success=False, score=0.0, analysis=f"derailed at step {i + 1} by choosing '{chosen}'")
             return False
